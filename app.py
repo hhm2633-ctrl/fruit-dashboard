@@ -935,7 +935,20 @@ def render_dashboard():
                             f"**주문 ID:** `{o['order_id']}` | **옵션 ID:** `{o['option_id']}`"
                         )
                         st.markdown(f"**상품명:** {o['product_name']} | 수량: {o['quantity']}개")
-                        st.caption("💡 사이드바에서 해당 옵션ID를 등록하면 자동 분류됩니다.")
+                        st.markdown(f"👤 **{o['orderer_name']}** &nbsp; 📞 {o['phone']}", unsafe_allow_html=True)
+                        st.markdown(f"📍 {o['address'] or '주소 정보 없음'}")
+                        if o["delivery_message"]:
+                            st.markdown(f"💬 *{o['delivery_message']}*")
+
+                        quick_copy = (
+                            f"{o['product_name']} × {o['quantity']}개 | "
+                            f"{o['orderer_name']} {o['phone']} | "
+                            f"{o['address']}"
+                            + (f" | 요청: {o['delivery_message']}" if o["delivery_message"] else "")
+                        )
+                        st.code(quick_copy, language=None)
+
+                        st.caption("💡 사이드바에서 해당 옵션ID를 등록하면 도매사별 탭으로 자동 분류됩니다.")
                 continue
 
             # 일반 도매사 탭
