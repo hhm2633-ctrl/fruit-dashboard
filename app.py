@@ -11,6 +11,7 @@ import json
 import http.client
 import requests
 import random
+import openpyxl
 from urllib.parse import urlencode
 
 # ══════════════════════════════════════════
@@ -106,15 +107,27 @@ footer    { visibility: hidden; }
 # ══════════════════════════════════════════
 #  세션 상태 초기화
 # ══════════════════════════════════════════
+def _secret(key: str, default: str = "") -> str:
+    """secrets.toml 값 안전하게 읽기 (없어도 에러 없이 default 반환)."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
 def _init():
     defaults = {
         "logged_in": False,
         "product_master": [],       # 상품 마스터 리스트
         "orders": [],               # 수집된 주문 리스트
-        "api_access_key": "",
-        "api_secret_key": "",
-        "api_vendor_id": "",
+        # API 키/시트 URL은 secrets.toml에 저장해두면 새로고침·재접속해도 유지됨
+        "api_access_key": _secret("coupang_access_key"),
+        "api_secret_key": _secret("coupang_secret_key"),
+        "api_vendor_id":  _secret("coupang_vendor_id"),
         "dialog_order": None,       # 팝업에 표시할 주문
+        "gsheet_url": _secret("gsheet_url"),  # 결제 기록/상품마스터/주문캐시용 구글 시트 URL
+        "_recent_payments": [],     # 최근 결제 기록 캐시
+        "_synced_from_sheet": False,  # 앱 시작 시 구글시트에서 1회 자동 불러오기 여부
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -158,11 +171,17 @@ def login_page():
                     st.rerun()
                 else:
                     st.error("❌ 비밀번호가 올바르지 않습니다.")
-            st.markdown(
-                '<p class="login-hint">기본 비밀번호: <code>fruit2024!</code><br>'
-                '<small>.streamlit/secrets.toml의 app_password로 변경 가능</small></p>',
-                unsafe_allow_html=True,
-            )
+            # 비밀번호를 secrets.toml에 아직 설정 안 했을 때만 운영자에게 보이는 경고
+            # (화면에 실제 비밀번호 값은 절대 노출하지 않음)
+            try:
+                _has_custom_pw = "app_password" in st.secrets
+            except Exception:
+                _has_custom_pw = False
+            if not _has_custom_pw:
+                st.caption(
+                    "⚠️ 기본 비밀번호가 사용 중입니다. "
+                    ".streamlit/secrets.toml에 app_password를 설정해 변경해주세요."
+                )
     return False
 
 
@@ -186,10 +205,11 @@ def _generate_auth_header(method: str, path: str, query_string: str,
     """
     쿠팡 HMAC-SHA256 Authorization 헤더 생성.
     반환: (auth_header, signed_datetime)
-    서명 메시지 형식: {datetime}\\n{METHOD}\\n{path}\\n{queryString}
+    서명 메시지 형식 (쿠팡 공식 Python 예제 기준): {datetime}{METHOD}{path}{queryString}
+    ※ 구분자 없이 그냥 이어붙임 (줄바꿈 X, '?' 도 넣지 않음)
     """
     dt = datetime.datetime.utcnow().strftime("%y%m%dT%H%M%SZ")
-    message = f"{dt}\n{method}\n{path}\n{query_string}"
+    message = f"{dt}{method}{path}{query_string}"
     signature = hmac.new(
         secret_key.encode("utf-8"),
         message.encode("utf-8"),
@@ -207,6 +227,8 @@ def _official_hmac(method: str, full_url: str, access_key: str, secret_key: str)
     쿠팡 공식 SDK 패턴을 그대로 따른 HMAC 생성.
     full_url 에서 path 와 query_string 을 추출해 서명.
     반환: (auth_header, datetime_str, debug_message)
+    서명 메시지 형식 (쿠팡 공식 Python 예제 기준): {datetime}{METHOD}{path}{queryString}
+    ※ 구분자 없이 그냥 이어붙임 (줄바꿈 X, '?' 도 넣지 않음)
     """
     stripped = full_url.replace("https://api-gateway.coupang.com", "")
     dt = datetime.datetime.utcnow().strftime("%y%m%dT%H%M%SZ")
@@ -216,7 +238,7 @@ def _official_hmac(method: str, full_url: str, access_key: str, secret_key: str)
     else:
         path_part, qs = stripped, ""
 
-    message = f"{dt}\n{method}\n{path_part}\n{qs}"
+    message = f"{dt}{method}{path_part}{qs}"
     signature = hmac.new(
         secret_key.encode("utf-8"),
         message.encode("utf-8"),
@@ -269,7 +291,7 @@ def fetch_coupang_orders(access_key: str, secret_key: str, vendor_id: str,
     if debug:
         with st.expander("🔍 API 서명 디버그 정보 (401 발생 시 확인용)", expanded=True):
             st.code(f"[Datetime]  {dt}\n[Method]    {method}\n[Path]      {path}\n[Query]     {qs}", language=None)
-            st.markdown("**서명 메시지 (4줄 연결):**")
+            st.markdown("**서명 메시지 (구분자 없이 이어붙임):**")
             st.code(dbg_msg, language=None)
             st.markdown("**요청 URL:**")
             st.code(full_url, language=None)
@@ -279,14 +301,25 @@ def fetch_coupang_orders(access_key: str, secret_key: str, vendor_id: str,
     headers_dict = {
         "Authorization": auth,
         "Content-Type":  "application/json;charset=UTF-8",
+        # 서버가 gzip으로 응답할 수 있어 명시적으로 비압축 요청
+        # (그래도 gzip이 올 수 있어 아래에서 Content-Encoding을 확인해 안전하게 처리)
+        "Accept-Encoding": "identity",
     }
 
     # http.client 사용 → URL 재인코딩 없이 정확히 전송
     conn = http.client.HTTPSConnection(HOST, timeout=10)
     conn.request("GET", f"{path}?{qs}", headers=headers_dict)
     resp = conn.getresponse()
-    resp_body = resp.read().decode("utf-8")
+    raw_body = resp.read()
     conn.close()
+
+    # 응답이 gzip으로 압축되어 온 경우 압축 해제
+    content_encoding = resp.getheader("Content-Encoding", "").lower()
+    if content_encoding == "gzip" or raw_body[:2] == b"\x1f\x8b":
+        import gzip
+        raw_body = gzip.decompress(raw_body)
+
+    resp_body = raw_body.decode("utf-8")
 
     if resp.status != 200:
         raise Exception(f"HTTP 오류 {resp.status}: {resp_body[:400]}")
@@ -317,6 +350,76 @@ def _parse_sheets(sheets: list) -> list:
                 "delivery_message": receiver.get("parcelPrintMessage", ""),
                 "status":          sheet.get("status", "ACCEPT"),
             })
+    return orders
+
+
+# ══════════════════════════════════════════
+#  엑셀(발주서) 업로드 파싱
+#  쿠팡 Wing → 주문/배송 → 발주서 조회 → 엑셀 다운로드 (DeliveryList_*.xlsx)
+# ══════════════════════════════════════════
+def parse_delivery_excel(uploaded_file) -> list:
+    """
+    쿠팡 Wing 발주서 조회 다운로드 엑셀(DeliveryList)을 내부 주문 형식으로 변환.
+    헤더 컬럼명을 기준으로 매칭하므로, 컬럼 순서가 바뀌어도 안전하게 동작.
+    """
+    wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+    sheet_name = "Delivery" if "Delivery" in wb.sheetnames else wb.sheetnames[0]
+    ws = wb[sheet_name]
+
+    header_cells = next(ws.iter_rows(min_row=1, max_row=1))
+    header = [str(c.value).strip() if c.value is not None else "" for c in header_cells]
+    col_idx = {name: i for i, name in enumerate(header) if name}
+
+    required = ["주문번호", "등록상품명", "옵션ID", "구매수(수량)", "옵션판매가(판매단가)"]
+    missing = [r for r in required if r not in col_idx]
+    if missing:
+        raise ValueError(
+            f"필수 컬럼을 찾을 수 없습니다: {', '.join(missing)}\n"
+            "쿠팡 Wing '주문/배송 → 발주서 조회' 메뉴에서 다운로드한 엑셀(DeliveryList)이 맞는지 확인해주세요."
+        )
+
+    def cell(row, name, default=""):
+        idx = col_idx.get(name)
+        if idx is None or idx >= len(row):
+            return default
+        val = row[idx]
+        return val if val not in (None, "") else default
+
+    orders = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or not cell(row, "주문번호"):
+            continue
+
+        try:
+            qty = int(float(cell(row, "구매수(수량)", 1) or 1))
+        except (ValueError, TypeError):
+            qty = 1
+        try:
+            price = int(float(cell(row, "옵션판매가(판매단가)", 0) or 0))
+        except (ValueError, TypeError):
+            price = 0
+
+        orderer_name = cell(row, "수취인이름") or cell(row, "구매자")
+        phone        = cell(row, "수취인전화번호") or cell(row, "구매자전화번호")
+
+        base_name   = str(cell(row, "등록상품명"))
+        option_name = str(cell(row, "등록옵션명"))
+        # 등록상품명만으로는 무게/수량 옵션(0.5kg vs 1kg 등)이 구분 안 되므로 옵션명을 합쳐서 표시
+        full_name = f"{base_name} ({option_name})" if option_name else base_name
+
+        orders.append({
+            "order_id":        str(cell(row, "주문번호")),
+            "ordered_at":      str(cell(row, "주문일")),
+            "option_id":       str(cell(row, "옵션ID")),
+            "product_name":    full_name,
+            "quantity":        qty,
+            "sale_price":      price,
+            "orderer_name":    str(orderer_name),
+            "phone":           str(phone),
+            "address":         str(cell(row, "수취인 주소")),
+            "delivery_message": str(cell(row, "배송메세지")),
+            "status":          "ACCEPT",
+        })
     return orders
 
 
@@ -424,84 +527,392 @@ def order_dialog(order: dict, master: dict):
 
 
 # ══════════════════════════════════════════
+#  결제 기록(세금 증빙용) – 구글 시트 연동
+# ══════════════════════════════════════════
+def _get_gsheet_client():
+    """구글 시트 연결 클라이언트 생성. secrets.toml의 [gcp_service_account] 섹션 필요."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        raise RuntimeError(
+            "gspread / google-auth 패키지가 설치되어 있지 않습니다. "
+            "requirements.txt에 'gspread'와 'google-auth'를 추가하고 재배포해주세요."
+        )
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError(
+            "구글 서비스 계정 정보가 없습니다. .streamlit/secrets.toml에 "
+            "[gcp_service_account] 섹션을 추가해주세요. (사이드바 하단 '연동 설정 방법' 참고)"
+        )
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=scopes
+    )
+    return gspread.authorize(creds)
+
+
+def _get_or_create_worksheet(title: str, headers: list):
+    """제목의 워크시트를 가져오거나, 없으면 헤더와 함께 새로 생성."""
+    if not st.session_state.gsheet_url:
+        raise RuntimeError("사이드바에서 구글 시트 URL을 먼저 입력해주세요.")
+    client = _get_gsheet_client()
+    sh = client.open_by_url(st.session_state.gsheet_url)
+    try:
+        ws = sh.worksheet(title)
+    except Exception:
+        ws = sh.add_worksheet(title=title, rows=2000, cols=max(len(headers), 1))
+        ws.append_row(headers)
+    return ws
+
+
+_PAYMENT_HEADERS = ["기록일시", "주문ID", "도매처", "결제일시", "결제수단", "은행/카드사", "금액", "메모"]
+
+
+def _get_payment_worksheet():
+    """결제 기록용 워크시트 객체 반환. 없으면 헤더와 함께 새로 생성."""
+    return _get_or_create_worksheet("결제기록", _PAYMENT_HEADERS)
+
+
+def append_payment_record(record: dict):
+    """결제 기록 1건을 구글 시트에 추가."""
+    ws = _get_payment_worksheet()
+    ws.append_row([
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        record.get("order_id", ""),
+        record.get("wholesale_name", ""),
+        record.get("pay_datetime", ""),
+        record.get("pay_method", ""),
+        record.get("bank_or_card", ""),
+        record.get("amount", 0),
+        record.get("memo", ""),
+    ])
+
+
+def fetch_recent_payment_records(limit: int = 10) -> list:
+    """최근 결제 기록 N건을 최신순으로 반환."""
+    ws = _get_payment_worksheet()
+    rows = ws.get_all_records()
+    return list(reversed(rows))[:limit]
+
+
+# ── 상품 마스터 저장/불러오기 ──
+_PRODUCT_HEADERS = ["옵션ID", "제품이름", "원가", "판매가", "수수료율", "도매처", "도매URL"]
+
+
+def save_product_master_to_sheet():
+    """현재 상품 마스터 전체를 구글 시트에 덮어쓰기 저장."""
+    ws = _get_or_create_worksheet("상품마스터", _PRODUCT_HEADERS)
+    ws.clear()
+    ws.append_row(_PRODUCT_HEADERS)
+    rows = [
+        [p["option_id"], p["product_name"], p["cost_price"], p["sale_price"],
+         p["fee_rate"], p["wholesale_name"], p["wholesale_url"]]
+        for p in st.session_state.product_master
+    ]
+    if rows:
+        ws.append_rows(rows)
+
+
+def load_product_master_from_sheet() -> list:
+    """구글 시트에 저장된 상품 마스터를 불러옴."""
+    ws = _get_or_create_worksheet("상품마스터", _PRODUCT_HEADERS)
+    records = ws.get_all_records()
+    result = []
+    for r in records:
+        if not r.get("옵션ID"):
+            continue
+        result.append({
+            "option_id":     str(r.get("옵션ID", "")),
+            "product_name":  r.get("제품이름", ""),
+            "cost_price":    int(float(r.get("원가", 0) or 0)),
+            "sale_price":    int(float(r.get("판매가", 0) or 0)),
+            "fee_rate":      float(r.get("수수료율", 0) or 0),
+            "wholesale_name":r.get("도매처", ""),
+            "wholesale_url": r.get("도매URL", ""),
+        })
+    return result
+
+
+# ── 주문 데이터 캐시 저장/불러오기 (새로고침해도 다시 업로드 안 해도 됨) ──
+_ORDER_HEADERS = [
+    "order_id", "ordered_at", "option_id", "product_name", "quantity",
+    "sale_price", "orderer_name", "phone", "address", "delivery_message", "status",
+]
+
+
+def save_orders_cache_to_sheet(orders: list):
+    """현재 주문 목록 전체를 구글 시트에 덮어쓰기 저장 (마지막 동기화 스냅샷)."""
+    ws = _get_or_create_worksheet("주문캐시", _ORDER_HEADERS)
+    ws.clear()
+    ws.append_row(_ORDER_HEADERS)
+    rows = [[o.get(h, "") for h in _ORDER_HEADERS] for o in orders]
+    if rows:
+        ws.append_rows(rows)
+
+
+def load_orders_cache_from_sheet() -> list:
+    """구글 시트에 저장된 마지막 주문 스냅샷을 불러옴."""
+    ws = _get_or_create_worksheet("주문캐시", _ORDER_HEADERS)
+    records = ws.get_all_records()
+    orders = []
+    for r in records:
+        if not r.get("order_id"):
+            continue
+        orders.append({
+            "order_id":        str(r.get("order_id", "")),
+            "ordered_at":      str(r.get("ordered_at", "")),
+            "option_id":       str(r.get("option_id", "")),
+            "product_name":    str(r.get("product_name", "")),
+            "quantity":        int(float(r.get("quantity", 1) or 1)),
+            "sale_price":      int(float(r.get("sale_price", 0) or 0)),
+            "orderer_name":    str(r.get("orderer_name", "")),
+            "phone":           str(r.get("phone", "")),
+            "address":         str(r.get("address", "")),
+            "delivery_message":str(r.get("delivery_message", "")),
+            "status":          str(r.get("status", "ACCEPT")),
+        })
+    return orders
+
+
+# ══════════════════════════════════════════
 #  사이드바 – 상품 마스터 관리
 # ══════════════════════════════════════════
+def _render_product_master_panel():
+    if st.session_state.gsheet_url:
+        sc1, sc2 = st.columns(2)
+        if sc1.button("☁️ 시트에서 불러오기", use_container_width=True, key="btn_load_pm"):
+            try:
+                st.session_state.product_master = load_product_master_from_sheet()
+                st.success(f"✅ {len(st.session_state.product_master)}개 상품 불러옴")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ {e}")
+        if sc2.button("💾 시트에 저장", use_container_width=True, key="btn_save_pm"):
+            try:
+                save_product_master_to_sheet()
+                st.success("✅ 저장 완료")
+            except Exception as e:
+                st.error(f"❌ {e}")
+    else:
+        st.caption("💡 사이드바 → 💰 결제 기록에서 구글시트를 연동하면, 여기 등록한 상품도 자동 저장되어 다음 접속 때 다시 입력 안 해도 됩니다.")
+
+    # API 키 설정
+    with st.expander("⚙️ 쿠팡 API 설정", expanded=False):
+        st.session_state.api_access_key = st.text_input(
+            "Access Key", value=st.session_state.api_access_key,
+            type="password", key="inp_ak",
+        )
+        st.session_state.api_secret_key = st.text_input(
+            "Secret Key", value=st.session_state.api_secret_key,
+            type="password", key="inp_sk",
+        )
+        st.session_state.api_vendor_id = st.text_input(
+            "Vendor ID", value=st.session_state.api_vendor_id, key="inp_vid",
+        )
+
+    # 상품 추가 폼
+    with st.expander("➕ 상품 추가", expanded=True):
+        with st.form("product_form", clear_on_submit=True):
+            option_id    = st.text_input("🔑 쿠팡등록번호(옵션ID)*", placeholder="예: 7654321098")
+            product_name = st.text_input("📦 제품이름*", placeholder="예: 제주 천혜향 5kg")
+            cost_price   = st.number_input("💰 원가(도매가, 원)", min_value=0, value=0, step=500)
+            sale_price   = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=0, step=500)
+            fee_rate     = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=10.8, step=0.1)
+            wholesale_nm = st.text_input("🏪 도매사 이름*", placeholder="예: 제주과일도매")
+            wholesale_url= st.text_input("🔗 도매 주문 페이지 URL", placeholder="https://...")
+
+            if st.form_submit_button("✅ 상품 등록", use_container_width=True, type="primary"):
+                if not option_id or not product_name or not wholesale_nm:
+                    st.error("* 표시 필드는 필수입니다.")
+                elif option_id in [p["option_id"] for p in st.session_state.product_master]:
+                    st.warning(f"옵션ID '{option_id}'는 이미 등록되어 있습니다.")
+                else:
+                    st.session_state.product_master.append({
+                        "option_id":     option_id,
+                        "product_name":  product_name,
+                        "cost_price":    cost_price,
+                        "sale_price":    sale_price,
+                        "fee_rate":      fee_rate,
+                        "wholesale_name":wholesale_nm,
+                        "wholesale_url": wholesale_url,
+                    })
+                    try:
+                        save_product_master_to_sheet()
+                    except Exception:
+                        pass  # 구글시트 미설정 시 조용히 무시 (세션 내에서는 계속 사용 가능)
+                    st.success(f"✅ '{product_name}' 등록 완료!")
+                    st.rerun()
+
+    # 등록 상품 목록
+    count = len(st.session_state.product_master)
+    st.markdown(f"#### 📋 등록 상품 ({count}개)")
+
+    if st.session_state.product_master:
+        for idx, p in enumerate(st.session_state.product_master):
+            with st.container(border=True):
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.markdown(f"**{p['product_name']}**")
+                    st.caption(f"ID: `{p['option_id']}` | {p['wholesale_name']}")
+                    if p["sale_price"] > 0:
+                        raw_margin = (p["sale_price"] - p["cost_price"]) / p["sale_price"] * 100 - p["fee_rate"]
+                        color = "#16a34a" if raw_margin >= 0 else "#dc2626"
+                        st.markdown(
+                            f"<small>판매가: ₩{p['sale_price']:,} | "
+                            f"마진: <span style='color:{color};font-weight:700'>{raw_margin:.1f}%</span></small>",
+                            unsafe_allow_html=True,
+                        )
+                with c2:
+                    if st.button("🗑️", key=f"del_{idx}", help="삭제"):
+                        st.session_state.product_master.pop(idx)
+                        try:
+                            save_product_master_to_sheet()
+                        except Exception:
+                            pass
+                        st.rerun()
+    else:
+        st.info("등록된 상품이 없습니다.\n위 폼에서 추가해주세요.")
+
+
+# ══════════════════════════════════════════
+#  사이드바 – 결제 기록 (세금 증빙용)
+# ══════════════════════════════════════════
+def _render_payment_panel():
+    st.caption("도매처 결제 정보(날짜/은행/카드/금액)를 구글시트에 자동 저장합니다. 사진 첨부 없이 텍스트만 기록합니다.")
+
+    with st.expander("🔧 구글시트 연동 설정", expanded=not st.session_state.gsheet_url):
+        st.session_state.gsheet_url = st.text_input(
+            "구글 시트 URL", value=st.session_state.gsheet_url,
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            key="inp_gsheet_url",
+        )
+        st.caption("⚠️ 시트를 서비스 계정 이메일과 '편집자' 권한으로 공유해야 합니다. 맨 아래 '연동 설정 방법' 참고.")
+        st.caption(
+            "💡 여기 입력한 URL은 이번 접속에서만 유지됩니다. **새로고침해도 계속 유지**하려면 "
+            "`.streamlit/secrets.toml`에 `gsheet_url = \"여기에 URL\"` 한 줄을 추가해주세요 "
+            "(아래 '연동 설정 방법'에 같이 안내되어 있습니다)."
+        )
+
+    wholesale_options = sorted({
+        p["wholesale_name"] for p in st.session_state.product_master if p.get("wholesale_name")
+    })
+    order_id_options = [""] + [o["order_id"] for o in st.session_state.orders]
+
+    with st.expander("➕ 결제 기록 추가", expanded=True):
+        with st.form("payment_form", clear_on_submit=True):
+            order_id = st.selectbox("🔗 연결할 주문 ID (선택)", order_id_options)
+            if wholesale_options:
+                wholesale_name = st.selectbox("🏪 도매처", wholesale_options)
+            else:
+                wholesale_name = st.text_input("🏪 도매처", placeholder="예: 제주과일도매")
+            pcol1, pcol2 = st.columns(2)
+            pay_date = pcol1.date_input("📅 결제 날짜")
+            pay_time = pcol2.time_input("🕒 결제 시각")
+            pay_method = st.selectbox("💳 결제 수단", ["카드", "현금", "계좌이체"])
+            bank_or_card = st.text_input("🏦 은행명 / 카드사", placeholder="예: 국민은행, 신한카드")
+            amount = st.number_input("💰 금액(원)", min_value=0, value=0, step=1000)
+            memo = st.text_input("📝 메모", placeholder="예: 6/19 주문 5건 일괄결제")
+
+            if st.form_submit_button("✅ 결제 기록 저장", use_container_width=True, type="primary"):
+                if not st.session_state.gsheet_url:
+                    st.error("구글 시트 URL을 먼저 설정해주세요.")
+                elif amount <= 0:
+                    st.error("금액을 입력해주세요.")
+                else:
+                    try:
+                        append_payment_record({
+                            "order_id":      order_id,
+                            "wholesale_name":wholesale_name,
+                            "pay_datetime":  f"{pay_date} {pay_time.strftime('%H:%M')}",
+                            "pay_method":    pay_method,
+                            "bank_or_card":  bank_or_card,
+                            "amount":        amount,
+                            "memo":          memo,
+                        })
+                        st.success("✅ 결제 기록이 구글시트에 저장되었습니다!")
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+
+    st.divider()
+    st.markdown("#### 🧾 최근 결제 기록")
+    if st.session_state.gsheet_url:
+        if st.button("🔄 최근 기록 불러오기", use_container_width=True):
+            try:
+                st.session_state._recent_payments = fetch_recent_payment_records(10)
+            except Exception as e:
+                st.error(f"❌ {e}")
+
+        if st.session_state._recent_payments:
+            for r in st.session_state._recent_payments:
+                with st.container(border=True):
+                    st.caption(f"{r.get('결제일시','')} · {r.get('도매처','')}")
+                    amt = r.get("금액", 0)
+                    try:
+                        amt = int(amt)
+                    except (ValueError, TypeError):
+                        amt = 0
+                    st.markdown(f"**₩{amt:,}** · {r.get('결제수단','')} ({r.get('은행/카드사','')})")
+                    if r.get("메모"):
+                        st.caption(f"📝 {r['메모']}")
+        else:
+            st.caption("아직 불러온 기록이 없습니다. 위 버튼을 눌러주세요.")
+    else:
+        st.info("구글 시트 URL을 먼저 설정해주세요.")
+
+    with st.expander("📖 구글시트 연동 설정 방법 (최초 1회만)", expanded=False):
+        st.markdown(
+            "1. **구글 시트**에서 빈 시트 하나 새로 만들고 URL 복사\n"
+            "2. **Google Cloud Console**(console.cloud.google.com) → 새 프로젝트 생성\n"
+            "3. **API 라이브러리**에서 `Google Sheets API`, `Google Drive API` 활성화\n"
+            "4. **사용자 인증정보 → 서비스 계정 만들기** → 생성 후 '키' 탭에서 JSON 키 다운로드\n"
+            "5. 다운로드한 JSON 내용 + 시트 URL을 `.streamlit/secrets.toml`에 아래 형식으로 붙여넣기 "
+            "(URL을 여기에 같이 넣어두면 **새로고침·재접속해도 자동으로 다시 연결**됩니다):\n"
+        )
+        st.code(
+            'gsheet_url = "https://docs.google.com/spreadsheets/d/여기에_시트ID/edit"\n\n'
+            '[gcp_service_account]\n'
+            'type = "service_account"\n'
+            'project_id = "..."\n'
+            'private_key_id = "..."\n'
+            'private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"\n'
+            'client_email = "...@....iam.gserviceaccount.com"\n'
+            'client_id = "..."\n'
+            'token_uri = "https://oauth2.googleapis.com/token"',
+            language="toml",
+        )
+        st.markdown(
+            "6. JSON 안의 `client_email` 값을 복사해서, **1번 시트를 그 이메일과 '편집자' 권한으로 공유**\n"
+            "7. requirements.txt에 `gspread`, `google-auth` 추가 후 재배포\n"
+            "8. 재배포하면 자동으로 연결되어 있을 거예요 (위 입력칸에 매번 URL 안 넣어도 됨)\n\n"
+            "💡 Streamlit Community Cloud에 배포 중이라면, 로컬 파일 대신 "
+            "**앱 설정(Settings) → Secrets** 메뉴에 위 내용을 그대로 붙여넣으시면 됩니다."
+        )
+
+
 def render_sidebar():
     with st.sidebar:
         st.markdown(
-            '<div class="sb-header"><h3>🍊 상품 마스터 관리</h3>'
-            "<small>도매사 & 상품 정보</small></div>",
+            '<div class="sb-header"><h3>🍊 발주 대시보드 관리</h3>'
+            "<small>상품 마스터 & 결제 기록</small></div>",
             unsafe_allow_html=True,
         )
 
-        # API 키 설정
-        with st.expander("⚙️ 쿠팡 API 설정", expanded=False):
-            st.session_state.api_access_key = st.text_input(
-                "Access Key", value=st.session_state.api_access_key,
-                type="password", key="inp_ak",
-            )
-            st.session_state.api_secret_key = st.text_input(
-                "Secret Key", value=st.session_state.api_secret_key,
-                type="password", key="inp_sk",
-            )
-            st.session_state.api_vendor_id = st.text_input(
-                "Vendor ID", value=st.session_state.api_vendor_id, key="inp_vid",
-            )
+        nav = st.radio(
+            "사이드바 카테고리",
+            ["🍊 상품 마스터", "💰 결제 기록(세금)"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="sidebar_nav",
+        )
+        st.divider()
 
-        # 상품 추가 폼
-        with st.expander("➕ 상품 추가", expanded=True):
-            with st.form("product_form", clear_on_submit=True):
-                option_id    = st.text_input("🔑 쿠팡등록번호(옵션ID)*", placeholder="예: 7654321098")
-                product_name = st.text_input("📦 제품이름*", placeholder="예: 제주 천혜향 5kg")
-                cost_price   = st.number_input("💰 원가(도매가, 원)", min_value=0, value=0, step=500)
-                sale_price   = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=0, step=500)
-                fee_rate     = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=10.8, step=0.1)
-                wholesale_nm = st.text_input("🏪 도매사 이름*", placeholder="예: 제주과일도매")
-                wholesale_url= st.text_input("🔗 도매 주문 페이지 URL", placeholder="https://...")
-
-                if st.form_submit_button("✅ 상품 등록", use_container_width=True, type="primary"):
-                    if not option_id or not product_name or not wholesale_nm:
-                        st.error("* 표시 필드는 필수입니다.")
-                    elif option_id in [p["option_id"] for p in st.session_state.product_master]:
-                        st.warning(f"옵션ID '{option_id}'는 이미 등록되어 있습니다.")
-                    else:
-                        st.session_state.product_master.append({
-                            "option_id":     option_id,
-                            "product_name":  product_name,
-                            "cost_price":    cost_price,
-                            "sale_price":    sale_price,
-                            "fee_rate":      fee_rate,
-                            "wholesale_name":wholesale_nm,
-                            "wholesale_url": wholesale_url,
-                        })
-                        st.success(f"✅ '{product_name}' 등록 완료!")
-                        st.rerun()
-
-        # 등록 상품 목록
-        count = len(st.session_state.product_master)
-        st.markdown(f"#### 📋 등록 상품 ({count}개)")
-
-        if st.session_state.product_master:
-            for idx, p in enumerate(st.session_state.product_master):
-                with st.container(border=True):
-                    c1, c2 = st.columns([5, 1])
-                    with c1:
-                        st.markdown(f"**{p['product_name']}**")
-                        st.caption(f"ID: `{p['option_id']}` | {p['wholesale_name']}")
-                        if p["sale_price"] > 0:
-                            raw_margin = (p["sale_price"] - p["cost_price"]) / p["sale_price"] * 100 - p["fee_rate"]
-                            color = "#16a34a" if raw_margin >= 0 else "#dc2626"
-                            st.markdown(
-                                f"<small>판매가: ₩{p['sale_price']:,} | "
-                                f"마진: <span style='color:{color};font-weight:700'>{raw_margin:.1f}%</span></small>",
-                                unsafe_allow_html=True,
-                            )
-                    with c2:
-                        if st.button("🗑️", key=f"del_{idx}", help="삭제"):
-                            st.session_state.product_master.pop(idx)
-                            st.rerun()
+        if nav == "🍊 상품 마스터":
+            _render_product_master_panel()
         else:
-            st.info("등록된 상품이 없습니다.\n위 폼에서 추가해주세요.")
+            _render_payment_panel()
 
         # 로그아웃
         st.divider()
@@ -539,6 +950,10 @@ def render_dashboard():
                     try:
                         orders = fetch_coupang_orders(ak, sk, vid, debug=True)
                         st.session_state.orders = orders
+                        try:
+                            save_orders_cache_to_sheet(orders)
+                        except Exception:
+                            pass
                         st.success(f"✅ {len(orders)}건 주문 동기화 완료!")
                         st.rerun()
                     except Exception as e:
@@ -560,6 +975,32 @@ def render_dashboard():
         if st.button("🗑️ 초기화", use_container_width=True):
             st.session_state.orders = []
             st.rerun()
+
+    # ── 엑셀(발주서) 업로드: API IP 미등록/오류 시 대체 수단 ──
+    with st.expander("📁 엑셀로 주문 가져오기 (쿠팡 Wing 발주서 조회 다운로드 파일)", expanded=False):
+        st.caption(
+            "쿠팡 Wing → 주문/배송 → 발주서 조회 → 엑셀 다운로드(DeliveryList_*.xlsx) 파일을 그대로 올려주세요. "
+            "API 연동이 안 되는 환경에서도 동일하게 도매사별 자동 분류가 적용됩니다."
+        )
+        if st.session_state.gsheet_url:
+            st.caption("☁️ 구글시트 연동 중 — 업로드한 주문은 자동 저장되어 새로고침해도 유지됩니다.")
+        uploaded = st.file_uploader("발주서 엑셀 파일 선택", type=["xlsx"], key="delivery_excel_uploader")
+        if uploaded is not None:
+            if st.button("📥 업로드한 파일로 주문 불러오기", use_container_width=True, type="primary"):
+                try:
+                    orders = parse_delivery_excel(uploaded)
+                    if not orders:
+                        st.warning("⚠️ 파일에서 주문 데이터를 찾지 못했습니다. 파일 양식을 확인해주세요.")
+                    else:
+                        st.session_state.orders = orders
+                        try:
+                            save_orders_cache_to_sheet(orders)
+                        except Exception:
+                            pass
+                        st.success(f"✅ {len(orders)}건 주문을 엑셀에서 불러왔습니다!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
 
     # ── 주문 없음 안내 ──
     if not st.session_state.orders:
@@ -638,7 +1079,20 @@ def render_dashboard():
                             f"**주문 ID:** `{o['order_id']}` | **옵션 ID:** `{o['option_id']}`"
                         )
                         st.markdown(f"**상품명:** {o['product_name']} | 수량: {o['quantity']}개")
-                        st.caption("💡 사이드바에서 해당 옵션ID를 등록하면 자동 분류됩니다.")
+                        st.markdown(f"👤 **{o['orderer_name']}** &nbsp; 📞 {o['phone']}", unsafe_allow_html=True)
+                        st.markdown(f"📍 {o['address'] or '주소 정보 없음'}")
+                        if o["delivery_message"]:
+                            st.markdown(f"💬 *{o['delivery_message']}*")
+
+                        quick_copy = (
+                            f"{o['product_name']} × {o['quantity']}개 | "
+                            f"{o['orderer_name']} {o['phone']} | "
+                            f"{o['address']}"
+                            + (f" | 요청: {o['delivery_message']}" if o["delivery_message"] else "")
+                        )
+                        st.code(quick_copy, language=None)
+
+                        st.caption("💡 사이드바에서 해당 옵션ID를 등록하면 도매사별 탭으로 자동 분류됩니다.")
                 continue
 
             # 일반 도매사 탭
@@ -688,9 +1142,10 @@ def render_dashboard():
                         st.markdown(f"**{master['product_name']}**")
                         st.caption(f"주문 ID: `{o['order_id']}` | 옵션 ID: `{o['option_id']}`")
                         st.caption(f"🕒 {o['ordered_at']}")
-                        st.caption(
-                            f"👤 {o['orderer_name']} &nbsp; 📞 {o['phone']}"
-                        )
+                        st.markdown(f"👤 **{o['orderer_name']}** &nbsp; 📞 {o['phone']}", unsafe_allow_html=True)
+                        st.markdown(f"📍 {o['address'] or '주소 정보 없음'}")
+                        if o["delivery_message"]:
+                            st.markdown(f"💬 *{o['delivery_message']}*")
 
                     with c2:
                         mc1, mc2, mc3, mc4 = st.columns(4)
@@ -716,6 +1171,15 @@ def render_dashboard():
                         ):
                             order_dialog(o, master)
 
+                    # 도매사이트 발주 입력칸에 바로 붙여넣기용 (클릭 한 번 없이 카드에서 바로 복사)
+                    quick_copy = (
+                        f"{master['product_name']} × {o['quantity']}개 | "
+                        f"{o['orderer_name']} {o['phone']} | "
+                        f"{o['address']}"
+                        + (f" | 요청: {o['delivery_message']}" if o["delivery_message"] else "")
+                    )
+                    st.code(quick_copy, language=None)
+
 
 # ══════════════════════════════════════════
 #  진입점
@@ -725,6 +1189,18 @@ def main():
     if not st.session_state.logged_in:
         login_page()
         return
+
+    # 구글시트가 연동되어 있으면, 세션당 1회 자동으로 상품마스터/마지막 주문을 불러옴
+    # (새로고침/재접속할 때마다 다시 입력·업로드할 필요 없게)
+    if st.session_state.gsheet_url and not st.session_state._synced_from_sheet:
+        try:
+            if not st.session_state.product_master:
+                st.session_state.product_master = load_product_master_from_sheet()
+            if not st.session_state.orders:
+                st.session_state.orders = load_orders_cache_from_sheet()
+        except Exception:
+            pass  # 연동 설정이 미완료여도 앱은 정상 동작
+        st.session_state._synced_from_sheet = True
 
     # 로그인 후에만 사이드바와 대시보드 렌더링
     render_sidebar()
