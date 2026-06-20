@@ -12,6 +12,9 @@ import http.client
 import requests
 import random
 import openpyxl
+import pandas as pd
+import re
+from collections import defaultdict
 from urllib.parse import urlencode
 
 # ══════════════════════════════════════════
@@ -128,6 +131,8 @@ def _init():
         "gsheet_url": _secret("gsheet_url"),  # 결제 기록/상품마스터/주문캐시용 구글 시트 URL
         "_recent_payments": [],     # 최근 결제 기록 캐시
         "_synced_from_sheet": False,  # 앱 시작 시 구글시트에서 1회 자동 불러오기 여부
+        "_pm_edit_idx": None,       # 현재 수정 중인 상품 마스터 인덱스
+        "_pm_form_key": 0,          # 상품 추가 폼 리셋 카운터 (등록 성공 시에만 증가)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -424,8 +429,193 @@ def parse_delivery_excel(uploaded_file) -> list:
 
 
 # ══════════════════════════════════════════
-#  테스트 가상 주문 생성
+#  신상품 발굴 — 도매처 단가표 정밀 분석
+#  (품목명 / 중량 / 등급 / 개수구간을 각각 분리 추출해서,
+#   "1kg 대과"와 "1kg 중과"처럼 서로 다른 규격을 절대 같은 행으로 합치지 않음)
 # ══════════════════════════════════════════
+
+# 중량 패턴: "1kg", "500g", "10kg" 등 (숫자+단위를 그대로 캡처)
+_WEIGHT_PATTERN = re.compile(r'\d+(\.\d+)?\s?(kg|KG|Kg|g|G|ml|ML)\b')
+
+# 개당 낱개 중량: "개당 30g내외" 처럼 진짜 박스 중량(1kg)과 별개로, 알맹이 하나의 크기를 나타내는 표기
+# (개당 중량이 클수록 같은 등급이어도 더 굵은 과실 — 등급을 못 잡을 때 대체 비교 지표로 사용)
+_UNIT_WEIGHT_PATTERN = re.compile(r'개당\s?\d+(\.\d+)?\s?(g|kg|G|KG)')
+
+# 개수구간 패턴: "13-16과", "8-12과 내외", "18과", "13과내외", "1번과"/"1번"/"3-4번"(등급을 숫자로 매긴 표기) 등
+# 한글은 단어경계(\b)가 인식 안 되는 경우가 많아 \b를 쓰지 않음 (예: "13과내외"에서 과/내 사이는 경계가 아님)
+_COUNT_RANGE_PATTERN = re.compile(r'\d+\s?[-~]\s?\d+\s?(번과|번|과|개|미|입|구|수)')
+_COUNT_SINGLE_PATTERN = re.compile(r'\d+\s?(번과|번|과|개|미|입|구|수)')
+
+# 감귤류 영문 사이즈코드: "2S", "S-M", "3L", "S,M,L"(여러 사이즈 혼합) 등
+_CITRUS_SIZE_PATTERN = re.compile(r'(?<![A-Za-z0-9])([23]?[SML])(?:[-,/][23]?[SML])*(?![A-Za-z0-9])')
+
+# 포장형태 — 가격에 영향을 주는 정보라 지우지 않고 별도 태그로 보존
+_PACKAGE_WORDS = ['선물박스', '부직포가방', '스티로폼박스', '보자기', '지함']
+
+# 사이즈 등급 단어 — 2글자 이상은 부분일치로 매칭 (길이순 정렬 필수: "중대과"가 "중과"로 잘못 잘리는 것 방지)
+# 품질 등급 체계: 하품 < 중하 < 중품 < 중상 < 상품 < 특품 < 특상  (도매처마다 표현이 조금씩 다름)
+_SIZE_GRADE_WORDS = ['특대과', '중대과', '중소과', '소중과', '왕왕특', '로얄과', '로열과', '특상품', '중상품', '중하품',
+                     '왕미니', '꼬마과', '중상', '중하', '특상',
+                     '대과', '중과', '소과', '왕특', '특품', '상품', '중품', '하품', '특대',
+                     '로얄', '로열']
+
+# 사이즈와 무관한 '타입/형태' 태그 — 등급과 별도로 함께 표시 (둘 다 동시에 있을 수 있음, 예: "소과 + 가정용")
+_TYPE_TAGS = ['실속', '못난이', '정품', '가정용', '혼합', '랜덤', 'A급']
+
+# 1글자 등급(하/중/상/특)은 공백으로 독립된 토큰일 때만 인정 (다른 단어 속 글자와 혼동 방지)
+_GRADE_SINGLE_PATTERN = re.compile(r'(?:^|\s)([하중상특])(?:\s|$)')
+
+# 품목명에서만 제거할 마케팅성 잡음 (수량/중량/등급은 절대 건드리지 않음)
+_NOISE_WORDS = ['신규', 'NEW', 'New', 'new', '특가', '핫딜', '한정', '프리미엄', '단독', '이벤트',
+                '순차출고', '순차 출고', '전후', '조기출고', '예약', '사전예약', '선물용']
+
+_LOCATION_STOPWORDS = ['경북', '경남', '전남', '전북', '충남', '충북', '강원', '제주', '의성', '논산', '해남',
+                       '청도', '나주', '영동', '통영', '목포', '여수', '산지', '직송', '박스포함', '박스',
+                       '포장', '무료', '친환경', '무농약', '국내산', '수출용', '명품', '당도보장', '당도',
+                       '세척', '비세척', '급냉', '세트', '선물세트', '증정', '1차', '2차', '내외', '이상', '미만']
+
+
+def _strip_noise(text: str) -> str:
+    """이모지·대괄호/별표 마케팅 문구·날짜/순차출고 같은 잡음 제거 (수량·중량·등급은 보존)."""
+    tmp = text
+    tmp = re.sub(r'[\U0001F300-\U0001FAFF\u2600-\u27BF★☆]', ' ', tmp)   # 이모지/별표
+    tmp = re.sub(r'\[[^\]]*\]', ' ', tmp)                               # [마케팅용] 같은 대괄호 문구
+    tmp = re.sub(r'\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\..*$', ' ', tmp)       # 등록일시 꼬리표
+    tmp = re.sub(r'\d{1,2}\s*월\s*\d{1,2}\s*일\s*~?', ' ', tmp)         # "6월 23일~" 같은 출고일 안내
+    tmp = re.sub(r'\d{1,2}\s*/\s*\d{1,2}\s*', ' ', tmp)                 # "6/29" 같은 날짜 표기
+    for w in _NOISE_WORDS:
+        tmp = tmp.replace(w, ' ')
+    return tmp
+
+
+def parse_product_variant(full_name: str) -> dict:
+    """
+    상품명(+옵션명) 원문에서 품목명/중량/등급/개수구간/사이즈코드/포장형태를 각각 분리 추출.
+    추출 순서대로 텍스트에서 잘라내며 진행하므로(겹침 방지), 추출 순서가 중요함:
+    포장형태 → 개당중량 → 중량(kg/g) → 감귤사이즈코드 → 개수구간 → 등급
+    """
+    raw = str(full_name)
+
+    # 포장형태 (선물박스/부직포가방 등) — 대괄호 안에 있어도 잡아야 하므로 노이즈 제거 전에 먼저 확인
+    package = next((w for w in _PACKAGE_WORDS if w in raw), "")
+
+    work = _strip_noise(raw)
+    if package:
+        work = work.replace(package, ' ')
+
+    # 개당 낱개 중량 (예: "개당 30g내외") — 진짜 박스 중량(kg)보다 먼저 추출해야 "30g"이 중량으로 오인식 안 됨
+    unit_w_m = _UNIT_WEIGHT_PATTERN.search(work)
+    unit_weight = unit_w_m.group(0).replace(' ', '') if unit_w_m else ""
+    if unit_w_m:
+        work = work[:unit_w_m.start()] + ' ' + work[unit_w_m.end():]
+
+    weight_m = _WEIGHT_PATTERN.search(work)
+    weight = weight_m.group(0).replace(' ', '') if weight_m else ""
+    if weight_m:
+        work = work[:weight_m.start()] + ' ' + work[weight_m.end():]
+
+    size_m = _CITRUS_SIZE_PATTERN.search(work)
+    citrus_size = size_m.group(0).replace(' ', '') if size_m else ""
+    if size_m:
+        work = work[:size_m.start()] + ' ' + work[size_m.end():]
+
+    count_m = _COUNT_RANGE_PATTERN.search(work) or _COUNT_SINGLE_PATTERN.search(work)
+    count = count_m.group(0).replace(' ', '') if count_m else ""
+    if count_m:
+        work = work[:count_m.start()] + ' ' + work[count_m.end():]
+
+    grade = ""
+    for g in sorted(_SIZE_GRADE_WORDS, key=len, reverse=True):
+        if g in work:
+            grade = g
+            break
+    if not grade:
+        single_m = _GRADE_SINGLE_PATTERN.search(work)
+        if single_m:
+            grade = single_m.group(1)
+    if grade:
+        if len(grade) == 1:
+            work = re.sub(rf'(?:^|\s){re.escape(grade)}(?:\s|$)', ' ', work)
+        else:
+            work = work.replace(grade, ' ')
+
+    # 사이즈 등급과는 별개로 '가정용/혼합/못난이' 같은 타입 태그도 따로 추출 (둘 다 동시에 있을 수 있음)
+    type_tag = ""
+    for t in sorted(_TYPE_TAGS, key=len, reverse=True):
+        if t in work:
+            type_tag = t
+            work = work.replace(t, ' ')
+            break
+
+    base = re.sub(r'[()\[\]{}~/_,]', ' ', work)
+    for w in _LOCATION_STOPWORDS:
+        base = base.replace(w, ' ')
+    base = re.sub(r'\s+', ' ', base).strip()
+
+    # 비교 표시용 규격 라벨: "1kg 소과" / "S-M" / "1kg 중 (개당30g)" / "10kg 혼합 📦선물박스" 등
+    spec_parts = [p for p in [weight, grade, type_tag, citrus_size] if p]
+    if unit_weight:
+        spec_parts.append(f"({unit_weight})")
+    if count and count != grade:
+        spec_parts.append(f"({count})")
+    if package:
+        spec_parts.append(f"📦{package}")
+    spec_label = " ".join(spec_parts) if spec_parts else "규격미상"
+
+    return {
+        "base": base, "weight": weight, "grade": grade, "type_tag": type_tag, "count": count,
+        "citrus_size": citrus_size, "unit_weight": unit_weight, "package": package,
+        "spec_label": spec_label,
+    }
+
+
+def parse_vendor_excel(file_bytes, vendor_name: str, name_col, option_col, price_col, sheet_name=0) -> list:
+    """업로드된 도매처 단가표 엑셀에서 (도매처, 원본상품명, 원가) 목록을 추출."""
+    df = pd.read_excel(file_bytes, sheet_name=sheet_name)
+    items = []
+    for _, row in df.iterrows():
+        parts = []
+        if name_col and pd.notna(row.get(name_col)):
+            parts.append(str(row[name_col]).strip())
+        if option_col and option_col != "(없음)" and pd.notna(row.get(option_col)):
+            parts.append(str(row[option_col]).strip())
+        full_name = " ".join(p for p in parts if p)
+        price = row.get(price_col)
+        if not full_name or pd.isna(price):
+            continue
+        try:
+            price = float(re.sub(r'[^\d.]', '', str(price)))
+        except ValueError:
+            continue
+        if price <= 0:
+            continue
+        items.append({"공급사": vendor_name, "원본상품명": full_name, "원가": price})
+    return items
+
+
+def group_vendor_items(all_items: list) -> dict:
+    """
+    품목명(base) 기준 1차 그룹화 → 그 안에서 (중량, 등급, 개수구간)이 정확히 같은 것끼리만 2차로 묶어 비교.
+    같은 '사과'라도 1kg/2kg, 대과/중과/소과는 서로 다른 행으로 분리된다.
+    반환: { base명: { spec_label: {공급사: 최저원가, "_원본예시": str} } }
+    """
+    tree: dict = defaultdict(lambda: defaultdict(dict))
+    for it in all_items:
+        parsed = parse_product_variant(it["원본상품명"])
+        base = parsed["base"]
+        if len(base) < 2:
+            continue
+        spec = parsed["spec_label"]
+        vendor = it["공급사"]
+        bucket = tree[base][spec]
+        if vendor not in bucket or it["원가"] < bucket[vendor]:
+            bucket[vendor] = it["원가"]
+        tree[base][spec]["_원본예시"] = it["원본상품명"]
+    return tree
+
+
+# ══════════════════════════════════════════
+#  테스트 가상 주문 생성
 _NAMES    = ["김철수", "이영희", "박민준", "최수연", "정도현", "강지은", "윤성호", "임나영"]
 _PHONES   = ["010-1234-5678", "010-9876-5432", "010-5555-7777", "010-3333-4444"]
 _ADDRS    = [
@@ -713,22 +903,82 @@ def _render_product_master_panel():
             "Vendor ID", value=st.session_state.api_vendor_id, key="inp_vid",
         )
 
+    # 기존 등록된 도매사 목록 (이름→URL) — 반복 입력 줄이기용 자동완성
+    existing_wholesalers = {}
+    for p in st.session_state.product_master:
+        if p.get("wholesale_name"):
+            existing_wholesalers[p["wholesale_name"]] = p.get("wholesale_url", "")
+
+    # ── 상품 수정 폼 (목록에서 ✏️ 누르면 여기에 표시) ──
+    edit_idx = st.session_state._pm_edit_idx
+    if edit_idx is not None and 0 <= edit_idx < len(st.session_state.product_master):
+        p = st.session_state.product_master[edit_idx]
+        with st.expander(f"✏️ 상품 수정 — {p['product_name']}", expanded=True):
+            with st.form(f"edit_form_{edit_idx}"):
+                e_oid   = st.text_input("🔑 쿠팡등록번호(옵션ID)*", value=p["option_id"])
+                e_pname = st.text_input("📦 제품이름*", value=p["product_name"])
+                e_cost  = st.number_input("💰 원가(도매가, 원)", min_value=0, value=p["cost_price"], step=500)
+                e_sale  = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=p["sale_price"], step=500)
+                e_fee   = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=p["fee_rate"], step=0.1)
+                e_wname = st.text_input("🏪 도매사 이름*", value=p["wholesale_name"])
+                e_wurl  = st.text_input("🔗 도매 주문 페이지 URL", value=p["wholesale_url"])
+
+                ec1, ec2 = st.columns(2)
+                save_clicked   = ec1.form_submit_button("💾 수정 저장", use_container_width=True, type="primary")
+                cancel_clicked = ec2.form_submit_button("취소", use_container_width=True)
+
+                if save_clicked:
+                    if not e_oid or not e_pname or not e_wname:
+                        st.error("* 표시 필드는 필수입니다.")
+                    else:
+                        st.session_state.product_master[edit_idx] = {
+                            "option_id":     e_oid,
+                            "product_name":  e_pname,
+                            "cost_price":    e_cost,
+                            "sale_price":    e_sale,
+                            "fee_rate":      e_fee,
+                            "wholesale_name":e_wname,
+                            "wholesale_url": e_wurl,
+                        }
+                        try:
+                            save_product_master_to_sheet()
+                        except Exception:
+                            pass
+                        st.session_state._pm_edit_idx = None
+                        st.success("✅ 수정 완료!")
+                        st.rerun()
+                if cancel_clicked:
+                    st.session_state._pm_edit_idx = None
+                    st.rerun()
+
     # 상품 추가 폼
     with st.expander("➕ 상품 추가", expanded=True):
-        with st.form("product_form", clear_on_submit=True):
+        default_wname, default_wurl = "", ""
+        if existing_wholesalers:
+            picked = st.selectbox(
+                "🏪 기존 도매사에서 선택 (선택하면 아래 도매사 정보 자동 입력)",
+                ["+ 새 도매사 직접 입력"] + sorted(existing_wholesalers.keys()),
+                key="pm_wholesale_picker",
+            )
+            if picked != "+ 새 도매사 직접 입력":
+                default_wname, default_wurl = picked, existing_wholesalers[picked]
+
+        # form_key는 등록 '성공'했을 때만 증가시켜서, 검증 실패 시 입력값이 유지되게 함
+        form_key = f"product_form_{st.session_state._pm_form_key}"
+        with st.form(form_key):
             option_id    = st.text_input("🔑 쿠팡등록번호(옵션ID)*", placeholder="예: 7654321098")
             product_name = st.text_input("📦 제품이름*", placeholder="예: 제주 천혜향 5kg")
             cost_price   = st.number_input("💰 원가(도매가, 원)", min_value=0, value=0, step=500)
             sale_price   = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=0, step=500)
             fee_rate     = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=10.8, step=0.1)
-            wholesale_nm = st.text_input("🏪 도매사 이름*", placeholder="예: 제주과일도매")
-            wholesale_url= st.text_input("🔗 도매 주문 페이지 URL", placeholder="https://...")
+            wholesale_nm = st.text_input("🏪 도매사 이름*", value=default_wname, placeholder="예: 제주과일도매")
+            wholesale_url= st.text_input("🔗 도매 주문 페이지 URL", value=default_wurl, placeholder="https://...")
 
             if st.form_submit_button("✅ 상품 등록", use_container_width=True, type="primary"):
                 if not option_id or not product_name or not wholesale_nm:
-                    st.error("* 표시 필드는 필수입니다.")
+                    st.error("* 표시 필드는 필수입니다. (입력하신 내용은 그대로 남아있어요)")
                 elif option_id in [p["option_id"] for p in st.session_state.product_master]:
-                    st.warning(f"옵션ID '{option_id}'는 이미 등록되어 있습니다.")
+                    st.warning(f"옵션ID '{option_id}'는 이미 등록되어 있습니다. (입력하신 내용은 그대로 남아있어요)")
                 else:
                     st.session_state.product_master.append({
                         "option_id":     option_id,
@@ -743,6 +993,7 @@ def _render_product_master_panel():
                         save_product_master_to_sheet()
                     except Exception:
                         pass  # 구글시트 미설정 시 조용히 무시 (세션 내에서는 계속 사용 가능)
+                    st.session_state._pm_form_key += 1  # 성공했을 때만 폼 리셋
                     st.success(f"✅ '{product_name}' 등록 완료!")
                     st.rerun()
 
@@ -753,7 +1004,7 @@ def _render_product_master_panel():
     if st.session_state.product_master:
         for idx, p in enumerate(st.session_state.product_master):
             with st.container(border=True):
-                c1, c2 = st.columns([5, 1])
+                c1, c2 = st.columns([5, 1.4])
                 with c1:
                     st.markdown(f"**{p['product_name']}**")
                     st.caption(f"ID: `{p['option_id']}` | {p['wholesale_name']}")
@@ -766,8 +1017,14 @@ def _render_product_master_panel():
                             unsafe_allow_html=True,
                         )
                 with c2:
-                    if st.button("🗑️", key=f"del_{idx}", help="삭제"):
+                    ec1, ec2 = st.columns(2)
+                    if ec1.button("✏️", key=f"edit_{idx}", help="수정"):
+                        st.session_state._pm_edit_idx = idx
+                        st.rerun()
+                    if ec2.button("🗑️", key=f"del_{idx}", help="삭제"):
                         st.session_state.product_master.pop(idx)
+                        if st.session_state._pm_edit_idx == idx:
+                            st.session_state._pm_edit_idx = None
                         try:
                             save_product_master_to_sheet()
                         except Exception:
@@ -1182,6 +1439,185 @@ def render_dashboard():
 
 
 # ══════════════════════════════════════════
+#  신상품 발굴 페이지 — 도매처별 단가표 업로드 → 동일품목 비교 → 빠른 등록
+# ══════════════════════════════════════════
+def render_sourcing_page():
+    st.markdown(
+        '<div class="dash-header">'
+        "<h1>🔍 신상품 발굴 · 원가 비교</h1>"
+        "<p>도매처별 단가표 업로드 → 품목명은 같게, 중량·등급·개수구간은 정확히 분리해서 비교</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    uploaded_files = st.file_uploader(
+        "도매처별 단가표 엑셀을 업로드하세요 (도매처마다 한 파일씩, 여러 개 동시 업로드 가능)",
+        type=["xlsx"], accept_multiple_files=True, key="vendor_price_files",
+    )
+
+    if not uploaded_files:
+        st.info(
+            "💡 '사과', '시나노사과'처럼 다른 품종은 따로 유지하고, 같은 품목이어도 "
+            "**1kg/2kg, 대과/중과/소과처럼 규격이 다르면 별도 행으로 분리해서** 도매처별 원가를 비교해드립니다."
+        )
+        return
+
+    def _guess(colnames, keys):
+        for c in colnames:
+            if any(k in str(c) for k in keys):
+                return c
+        return colnames[0]
+
+    all_items = []
+    for f in uploaded_files:
+        df_preview = pd.read_excel(f)
+        cols = list(df_preview.columns)
+
+        with st.expander(f"📄 {f.name} — 컬럼 매칭 확인", expanded=True):
+            st.dataframe(df_preview.head(3), use_container_width=True)
+
+            vendor_name = st.text_input(
+                "이 파일의 도매처 이름", value=f.name.rsplit(".", 1)[0], key=f"sc_vendor_{f.name}"
+            )
+            cc1, cc2, cc3 = st.columns(3)
+            name_col = cc1.selectbox(
+                "품목명 컬럼", cols, index=cols.index(_guess(cols, ["상품명"])), key=f"sc_name_{f.name}"
+            )
+            opt_options = ["(없음)"] + cols
+            opt_match = next((c for c in cols if "옵션명" in str(c)), None)
+            option_col = cc2.selectbox(
+                "옵션명 컬럼 (있으면 — 품목명과 합쳐서 분석)", opt_options,
+                index=opt_options.index(opt_match if opt_match else "(없음)"),
+                key=f"sc_opt_{f.name}",
+            )
+            price_col = cc3.selectbox(
+                "원가(공급가) 컬럼", cols, index=cols.index(_guess(cols, ["공급가", "원가"])), key=f"sc_price_{f.name}"
+            )
+
+        f.seek(0)
+        items = parse_vendor_excel(f, vendor_name, name_col, option_col, price_col)
+        all_items.extend(items)
+        st.caption(f"✅ {len(items)}개 항목 인식")
+
+    if not all_items:
+        return
+
+    st.divider()
+    tree = group_vendor_items(all_items)  # { 품목명: { 규격라벨: {도매처: 원가, "_원본예시": str} } }
+    total_specs = sum(len(specs) for specs in tree.values())
+    st.success(f"총 {len(all_items)}개 항목 → **{len(tree)}개 품목 · {total_specs}개 규격(중량×등급)**으로 정리되었습니다.")
+
+    # ── 품목 검색 ──
+    st.markdown("#### 🔎 품목 검색")
+    search = st.text_input(
+        "품목명을 입력하면 그 품목의 모든 규격을 도매처별로 비교해서 보여드립니다",
+        "", placeholder="예: 시나노사과",
+        label_visibility="collapsed",
+    )
+
+    if search.strip():
+        base_names = [b for b in tree if search.strip() in b]
+        st.caption(f"'{search.strip()}' 검색결과 {len(base_names)}개 품목")
+    else:
+        base_names = sorted(tree.keys(), key=lambda b: -len(tree[b]))
+        st.caption(f"전체 {len(base_names)}개 품목 중 규격 종류 많은 순 상위 30개 표시 (검색하면 전체에서 찾습니다)")
+        base_names = base_names[:30]
+
+    def _highlight_cheapest(row, vendor_cols):
+        """행에서 최저가 셀은 초록, 최고가 셀은 옅은 빨강으로 표시."""
+        styles = [''] * len(row)
+        vals = pd.to_numeric(row[vendor_cols], errors='coerce')
+        valid = vals.dropna()
+        if len(valid) < 1:
+            return styles
+        min_v, max_v = valid.min(), valid.max()
+        for i, col in enumerate(row.index):
+            if col not in vendor_cols or pd.isna(row[col]):
+                continue
+            if row[col] == min_v and min_v != max_v:
+                styles[i] = 'background-color:#bbf7d0; color:#166534; font-weight:700'
+            elif row[col] == max_v and min_v != max_v:
+                styles[i] = 'background-color:#fecaca; color:#991b1b'
+        return styles
+
+    for base in base_names:
+        specs = tree[base]
+        with st.container(border=True):
+            st.markdown(
+                f"**🍎 {base}** "
+                f"&nbsp; <small style='color:#94a3b8'>규격 {len(specs)}종류</small>",
+                unsafe_allow_html=True,
+            )
+
+            # 규격(행) × 도매처(열) 비교 매트릭스 — 최저가는 초록, 최고가는 빨강으로 강조
+            vendor_set = sorted({v for spec_vendors in specs.values() for v in spec_vendors if v != "_원본예시"})
+            table_rows = []
+            for spec_label, vendor_costs in specs.items():
+                row = {"규격": spec_label}
+                for v in vendor_set:
+                    row[v] = vendor_costs.get(v)  # 숫자 그대로 (None 허용)
+                table_rows.append(row)
+
+            spec_df = pd.DataFrame(table_rows).set_index("규격")
+            styled = (
+                spec_df.style
+                .apply(_highlight_cheapest, vendor_cols=vendor_set, axis=1)
+                .format(lambda x: f"₩{x:,.0f}" if pd.notna(x) else "-")
+            )
+            st.dataframe(styled, use_container_width=True)
+            st.caption("🟢 최저가 · 🔴 최고가")
+
+            with st.expander(f"📥 '{base}' 특정 규격 상품마스터에 빠른 등록"):
+                spec_options = list(specs.keys())
+                picked_spec = st.selectbox("등록할 규격 선택", spec_options, key=f"pick_spec_{re.sub(r'\W+', '_', base)}")
+                vendor_costs = {v: c for v, c in specs[picked_spec].items() if v != "_원본예시"}
+                cheapest_vendor = min(vendor_costs, key=vendor_costs.get)
+                cheapest_cost = vendor_costs[cheapest_vendor]
+                example_name = specs[picked_spec].get("_원본예시", f"{base} {picked_spec}")
+                safe_key = re.sub(r'\W+', '_', f"{base}_{picked_spec}")
+
+                with st.form(f"quickreg_{safe_key}"):
+                    q_oid = st.text_input(
+                        "🔑 쿠팡등록번호(옵션ID) — 아직 쿠팡에 등록 전이면 비워두세요 (나중에 사이드바에서 수정 가능)",
+                        key=f"q_oid_{safe_key}",
+                    )
+                    q_pname = st.text_input("📦 제품이름", value=f"{base} {picked_spec}".strip(), key=f"q_pname_{safe_key}")
+                    q_cost  = st.number_input("💰 원가(도매가)", min_value=0, value=int(cheapest_cost), step=500, key=f"q_cost_{safe_key}")
+                    q_sale  = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=int(cheapest_cost * 1.6), step=500, key=f"q_sale_{safe_key}")
+                    q_fee   = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=10.8, step=0.1, key=f"q_fee_{safe_key}")
+                    q_wname = st.selectbox("🏪 도매처 (최저가순)", sorted(vendor_costs, key=vendor_costs.get), key=f"q_wname_{safe_key}")
+                    q_wurl  = st.text_input("🔗 도매 주문 페이지 URL", key=f"q_wurl_{safe_key}")
+                    st.caption(f"원본 표기 예시: {example_name}")
+
+                    if st.form_submit_button("✅ 상품마스터에 등록", use_container_width=True, type="primary"):
+                        new_oid = q_oid.strip() or f"PENDING-{safe_key}"
+                        if new_oid in [p["option_id"] for p in st.session_state.product_master]:
+                            st.warning("이미 등록된 옵션ID입니다.")
+                        else:
+                            st.session_state.product_master.append({
+                                "option_id":     new_oid,
+                                "product_name":  q_pname,
+                                "cost_price":    q_cost,
+                                "sale_price":    q_sale,
+                                "fee_rate":      q_fee,
+                                "wholesale_name":q_wname,
+                                "wholesale_url": q_wurl,
+                            })
+                            try:
+                                save_product_master_to_sheet()
+                            except Exception:
+                                pass
+                            if not q_oid.strip():
+                                st.success(
+                                    f"✅ '{q_pname}' 등록 완료! 옵션ID는 임시값(PENDING-...)입니다. "
+                                    "쿠팡에 실제 등록 후 사이드바 → 🍊 상품 마스터에서 ✏️ 눌러 진짜 옵션ID로 수정해주세요."
+                                )
+                            else:
+                                st.success(f"✅ '{q_pname}' 등록 완료!")
+                            st.rerun()
+
+
+# ══════════════════════════════════════════
 #  진입점
 # ══════════════════════════════════════════
 def main():
@@ -1202,9 +1638,23 @@ def main():
             pass  # 연동 설정이 미완료여도 앱은 정상 동작
         st.session_state._synced_from_sheet = True
 
-    # 로그인 후에만 사이드바와 대시보드 렌더링
+    # 사이드바는 두 페이지 공통으로 항상 표시
     render_sidebar()
-    render_dashboard()
+
+    # 상단 가로 탭으로 페이지 전환
+    page = st.radio(
+        "페이지 선택",
+        ["📦 주문 관리", "🔍 신상품 발굴"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="top_page_nav",
+    )
+    st.divider()
+
+    if page == "📦 주문 관리":
+        render_dashboard()
+    else:
+        render_sourcing_page()
 
 
 if __name__ == "__main__":
