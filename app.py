@@ -107,17 +107,27 @@ footer    { visibility: hidden; }
 # ══════════════════════════════════════════
 #  세션 상태 초기화
 # ══════════════════════════════════════════
+def _secret(key: str, default: str = "") -> str:
+    """secrets.toml 값 안전하게 읽기 (없어도 에러 없이 default 반환)."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
 def _init():
     defaults = {
         "logged_in": False,
         "product_master": [],       # 상품 마스터 리스트
         "orders": [],               # 수집된 주문 리스트
-        "api_access_key": "",
-        "api_secret_key": "",
-        "api_vendor_id": "",
+        # API 키/시트 URL은 secrets.toml에 저장해두면 새로고침·재접속해도 유지됨
+        "api_access_key": _secret("coupang_access_key"),
+        "api_secret_key": _secret("coupang_secret_key"),
+        "api_vendor_id":  _secret("coupang_vendor_id"),
         "dialog_order": None,       # 팝업에 표시할 주문
-        "gsheet_url": "",           # 결제 기록용 구글 시트 URL
+        "gsheet_url": _secret("gsheet_url"),  # 결제 기록/상품마스터/주문캐시용 구글 시트 URL
         "_recent_payments": [],     # 최근 결제 기록 캐시
+        "_synced_from_sheet": False,  # 앱 시작 시 구글시트에서 1회 자동 불러오기 여부
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -538,22 +548,26 @@ def _get_gsheet_client():
     return gspread.authorize(creds)
 
 
+def _get_or_create_worksheet(title: str, headers: list):
+    """제목의 워크시트를 가져오거나, 없으면 헤더와 함께 새로 생성."""
+    if not st.session_state.gsheet_url:
+        raise RuntimeError("사이드바에서 구글 시트 URL을 먼저 입력해주세요.")
+    client = _get_gsheet_client()
+    sh = client.open_by_url(st.session_state.gsheet_url)
+    try:
+        ws = sh.worksheet(title)
+    except Exception:
+        ws = sh.add_worksheet(title=title, rows=2000, cols=max(len(headers), 1))
+        ws.append_row(headers)
+    return ws
+
+
 _PAYMENT_HEADERS = ["기록일시", "주문ID", "도매처", "결제일시", "결제수단", "은행/카드사", "금액", "메모"]
 
 
 def _get_payment_worksheet():
     """결제 기록용 워크시트 객체 반환. 없으면 헤더와 함께 새로 생성."""
-    gsheet_url = st.session_state.gsheet_url
-    if not gsheet_url:
-        raise RuntimeError("사이드바에서 구글 시트 URL을 먼저 입력해주세요.")
-    client = _get_gsheet_client()
-    sh = client.open_by_url(gsheet_url)
-    try:
-        ws = sh.worksheet("결제기록")
-    except Exception:
-        ws = sh.add_worksheet(title="결제기록", rows=2000, cols=len(_PAYMENT_HEADERS))
-        ws.append_row(_PAYMENT_HEADERS)
-    return ws
+    return _get_or_create_worksheet("결제기록", _PAYMENT_HEADERS)
 
 
 def append_payment_record(record: dict):
@@ -578,10 +592,107 @@ def fetch_recent_payment_records(limit: int = 10) -> list:
     return list(reversed(rows))[:limit]
 
 
+# ── 상품 마스터 저장/불러오기 ──
+_PRODUCT_HEADERS = ["옵션ID", "제품이름", "원가", "판매가", "수수료율", "도매처", "도매URL"]
+
+
+def save_product_master_to_sheet():
+    """현재 상품 마스터 전체를 구글 시트에 덮어쓰기 저장."""
+    ws = _get_or_create_worksheet("상품마스터", _PRODUCT_HEADERS)
+    ws.clear()
+    ws.append_row(_PRODUCT_HEADERS)
+    rows = [
+        [p["option_id"], p["product_name"], p["cost_price"], p["sale_price"],
+         p["fee_rate"], p["wholesale_name"], p["wholesale_url"]]
+        for p in st.session_state.product_master
+    ]
+    if rows:
+        ws.append_rows(rows)
+
+
+def load_product_master_from_sheet() -> list:
+    """구글 시트에 저장된 상품 마스터를 불러옴."""
+    ws = _get_or_create_worksheet("상품마스터", _PRODUCT_HEADERS)
+    records = ws.get_all_records()
+    result = []
+    for r in records:
+        if not r.get("옵션ID"):
+            continue
+        result.append({
+            "option_id":     str(r.get("옵션ID", "")),
+            "product_name":  r.get("제품이름", ""),
+            "cost_price":    int(float(r.get("원가", 0) or 0)),
+            "sale_price":    int(float(r.get("판매가", 0) or 0)),
+            "fee_rate":      float(r.get("수수료율", 0) or 0),
+            "wholesale_name":r.get("도매처", ""),
+            "wholesale_url": r.get("도매URL", ""),
+        })
+    return result
+
+
+# ── 주문 데이터 캐시 저장/불러오기 (새로고침해도 다시 업로드 안 해도 됨) ──
+_ORDER_HEADERS = [
+    "order_id", "ordered_at", "option_id", "product_name", "quantity",
+    "sale_price", "orderer_name", "phone", "address", "delivery_message", "status",
+]
+
+
+def save_orders_cache_to_sheet(orders: list):
+    """현재 주문 목록 전체를 구글 시트에 덮어쓰기 저장 (마지막 동기화 스냅샷)."""
+    ws = _get_or_create_worksheet("주문캐시", _ORDER_HEADERS)
+    ws.clear()
+    ws.append_row(_ORDER_HEADERS)
+    rows = [[o.get(h, "") for h in _ORDER_HEADERS] for o in orders]
+    if rows:
+        ws.append_rows(rows)
+
+
+def load_orders_cache_from_sheet() -> list:
+    """구글 시트에 저장된 마지막 주문 스냅샷을 불러옴."""
+    ws = _get_or_create_worksheet("주문캐시", _ORDER_HEADERS)
+    records = ws.get_all_records()
+    orders = []
+    for r in records:
+        if not r.get("order_id"):
+            continue
+        orders.append({
+            "order_id":        str(r.get("order_id", "")),
+            "ordered_at":      str(r.get("ordered_at", "")),
+            "option_id":       str(r.get("option_id", "")),
+            "product_name":    str(r.get("product_name", "")),
+            "quantity":        int(float(r.get("quantity", 1) or 1)),
+            "sale_price":      int(float(r.get("sale_price", 0) or 0)),
+            "orderer_name":    str(r.get("orderer_name", "")),
+            "phone":           str(r.get("phone", "")),
+            "address":         str(r.get("address", "")),
+            "delivery_message":str(r.get("delivery_message", "")),
+            "status":          str(r.get("status", "ACCEPT")),
+        })
+    return orders
+
+
 # ══════════════════════════════════════════
 #  사이드바 – 상품 마스터 관리
 # ══════════════════════════════════════════
 def _render_product_master_panel():
+    if st.session_state.gsheet_url:
+        sc1, sc2 = st.columns(2)
+        if sc1.button("☁️ 시트에서 불러오기", use_container_width=True, key="btn_load_pm"):
+            try:
+                st.session_state.product_master = load_product_master_from_sheet()
+                st.success(f"✅ {len(st.session_state.product_master)}개 상품 불러옴")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ {e}")
+        if sc2.button("💾 시트에 저장", use_container_width=True, key="btn_save_pm"):
+            try:
+                save_product_master_to_sheet()
+                st.success("✅ 저장 완료")
+            except Exception as e:
+                st.error(f"❌ {e}")
+    else:
+        st.caption("💡 사이드바 → 💰 결제 기록에서 구글시트를 연동하면, 여기 등록한 상품도 자동 저장되어 다음 접속 때 다시 입력 안 해도 됩니다.")
+
     # API 키 설정
     with st.expander("⚙️ 쿠팡 API 설정", expanded=False):
         st.session_state.api_access_key = st.text_input(
@@ -622,6 +733,10 @@ def _render_product_master_panel():
                         "wholesale_name":wholesale_nm,
                         "wholesale_url": wholesale_url,
                     })
+                    try:
+                        save_product_master_to_sheet()
+                    except Exception:
+                        pass  # 구글시트 미설정 시 조용히 무시 (세션 내에서는 계속 사용 가능)
                     st.success(f"✅ '{product_name}' 등록 완료!")
                     st.rerun()
 
@@ -647,6 +762,10 @@ def _render_product_master_panel():
                 with c2:
                     if st.button("🗑️", key=f"del_{idx}", help="삭제"):
                         st.session_state.product_master.pop(idx)
+                        try:
+                            save_product_master_to_sheet()
+                        except Exception:
+                            pass
                         st.rerun()
     else:
         st.info("등록된 상품이 없습니다.\n위 폼에서 추가해주세요.")
@@ -665,6 +784,11 @@ def _render_payment_panel():
             key="inp_gsheet_url",
         )
         st.caption("⚠️ 시트를 서비스 계정 이메일과 '편집자' 권한으로 공유해야 합니다. 맨 아래 '연동 설정 방법' 참고.")
+        st.caption(
+            "💡 여기 입력한 URL은 이번 접속에서만 유지됩니다. **새로고침해도 계속 유지**하려면 "
+            "`.streamlit/secrets.toml`에 `gsheet_url = \"여기에 URL\"` 한 줄을 추가해주세요 "
+            "(아래 '연동 설정 방법'에 같이 안내되어 있습니다)."
+        )
 
     wholesale_options = sorted({
         p["wholesale_name"] for p in st.session_state.product_master if p.get("wholesale_name")
@@ -738,9 +862,11 @@ def _render_payment_panel():
             "2. **Google Cloud Console**(console.cloud.google.com) → 새 프로젝트 생성\n"
             "3. **API 라이브러리**에서 `Google Sheets API`, `Google Drive API` 활성화\n"
             "4. **사용자 인증정보 → 서비스 계정 만들기** → 생성 후 '키' 탭에서 JSON 키 다운로드\n"
-            "5. 다운로드한 JSON 내용을 `.streamlit/secrets.toml`에 아래 형식으로 붙여넣기:\n"
+            "5. 다운로드한 JSON 내용 + 시트 URL을 `.streamlit/secrets.toml`에 아래 형식으로 붙여넣기 "
+            "(URL을 여기에 같이 넣어두면 **새로고침·재접속해도 자동으로 다시 연결**됩니다):\n"
         )
         st.code(
+            'gsheet_url = "https://docs.google.com/spreadsheets/d/여기에_시트ID/edit"\n\n'
             '[gcp_service_account]\n'
             'type = "service_account"\n'
             'project_id = "..."\n'
@@ -754,7 +880,9 @@ def _render_payment_panel():
         st.markdown(
             "6. JSON 안의 `client_email` 값을 복사해서, **1번 시트를 그 이메일과 '편집자' 권한으로 공유**\n"
             "7. requirements.txt에 `gspread`, `google-auth` 추가 후 재배포\n"
-            "8. 1번 시트 URL을 위 칸에 붙여넣으면 완료!"
+            "8. 재배포하면 자동으로 연결되어 있을 거예요 (위 입력칸에 매번 URL 안 넣어도 됨)\n\n"
+            "💡 Streamlit Community Cloud에 배포 중이라면, 로컬 파일 대신 "
+            "**앱 설정(Settings) → Secrets** 메뉴에 위 내용을 그대로 붙여넣으시면 됩니다."
         )
 
 
@@ -816,6 +944,10 @@ def render_dashboard():
                     try:
                         orders = fetch_coupang_orders(ak, sk, vid, debug=True)
                         st.session_state.orders = orders
+                        try:
+                            save_orders_cache_to_sheet(orders)
+                        except Exception:
+                            pass
                         st.success(f"✅ {len(orders)}건 주문 동기화 완료!")
                         st.rerun()
                     except Exception as e:
@@ -844,6 +976,8 @@ def render_dashboard():
             "쿠팡 Wing → 주문/배송 → 발주서 조회 → 엑셀 다운로드(DeliveryList_*.xlsx) 파일을 그대로 올려주세요. "
             "API 연동이 안 되는 환경에서도 동일하게 도매사별 자동 분류가 적용됩니다."
         )
+        if st.session_state.gsheet_url:
+            st.caption("☁️ 구글시트 연동 중 — 업로드한 주문은 자동 저장되어 새로고침해도 유지됩니다.")
         uploaded = st.file_uploader("발주서 엑셀 파일 선택", type=["xlsx"], key="delivery_excel_uploader")
         if uploaded is not None:
             if st.button("📥 업로드한 파일로 주문 불러오기", use_container_width=True, type="primary"):
@@ -853,6 +987,10 @@ def render_dashboard():
                         st.warning("⚠️ 파일에서 주문 데이터를 찾지 못했습니다. 파일 양식을 확인해주세요.")
                     else:
                         st.session_state.orders = orders
+                        try:
+                            save_orders_cache_to_sheet(orders)
+                        except Exception:
+                            pass
                         st.success(f"✅ {len(orders)}건 주문을 엑셀에서 불러왔습니다!")
                         st.rerun()
                 except Exception as e:
@@ -1045,6 +1183,18 @@ def main():
     if not st.session_state.logged_in:
         login_page()
         return
+
+    # 구글시트가 연동되어 있으면, 세션당 1회 자동으로 상품마스터/마지막 주문을 불러옴
+    # (새로고침/재접속할 때마다 다시 입력·업로드할 필요 없게)
+    if st.session_state.gsheet_url and not st.session_state._synced_from_sheet:
+        try:
+            if not st.session_state.product_master:
+                st.session_state.product_master = load_product_master_from_sheet()
+            if not st.session_state.orders:
+                st.session_state.orders = load_orders_cache_from_sheet()
+        except Exception:
+            pass  # 연동 설정이 미완료여도 앱은 정상 동작
+        st.session_state._synced_from_sheet = True
 
     # 로그인 후에만 사이드바와 대시보드 렌더링
     render_sidebar()
