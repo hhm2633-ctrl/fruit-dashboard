@@ -386,11 +386,16 @@ def parse_delivery_excel(uploaded_file) -> list:
         orderer_name = cell(row, "수취인이름") or cell(row, "구매자")
         phone        = cell(row, "수취인전화번호") or cell(row, "구매자전화번호")
 
+        base_name   = str(cell(row, "등록상품명"))
+        option_name = str(cell(row, "등록옵션명"))
+        # 등록상품명만으로는 무게/수량 옵션(0.5kg vs 1kg 등)이 구분 안 되므로 옵션명을 합쳐서 표시
+        full_name = f"{base_name} ({option_name})" if option_name else base_name
+
         orders.append({
             "order_id":        str(cell(row, "주문번호")),
             "ordered_at":      str(cell(row, "주문일")),
             "option_id":       str(cell(row, "옵션ID")),
-            "product_name":    str(cell(row, "등록상품명")),
+            "product_name":    full_name,
             "quantity":        qty,
             "sale_price":      price,
             "orderer_name":    str(orderer_name),
@@ -980,9 +985,10 @@ def render_dashboard():
                         st.markdown(f"**{master['product_name']}**")
                         st.caption(f"주문 ID: `{o['order_id']}` | 옵션 ID: `{o['option_id']}`")
                         st.caption(f"🕒 {o['ordered_at']}")
-                        st.caption(
-                            f"👤 {o['orderer_name']} &nbsp; 📞 {o['phone']}"
-                        )
+                        st.markdown(f"👤 **{o['orderer_name']}** &nbsp; 📞 {o['phone']}", unsafe_allow_html=True)
+                        st.markdown(f"📍 {o['address'] or '주소 정보 없음'}")
+                        if o["delivery_message"]:
+                            st.markdown(f"💬 *{o['delivery_message']}*")
 
                     with c2:
                         mc1, mc2, mc3, mc4 = st.columns(4)
@@ -1007,6 +1013,15 @@ def render_dashboard():
                             use_container_width=True,
                         ):
                             order_dialog(o, master)
+
+                    # 도매사이트 발주 입력칸에 바로 붙여넣기용 (클릭 한 번 없이 카드에서 바로 복사)
+                    quick_copy = (
+                        f"{master['product_name']} × {o['quantity']}개 | "
+                        f"{o['orderer_name']} {o['phone']} | "
+                        f"{o['address']}"
+                        + (f" | 요청: {o['delivery_message']}" if o["delivery_message"] else "")
+                    )
+                    st.code(quick_copy, language=None)
 
 
 # ══════════════════════════════════════════
