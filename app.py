@@ -136,6 +136,7 @@ def _init():
         "naver_client_id":     _secret("naver_client_id"),
         "naver_client_secret": _secret("naver_client_secret"),
         "_discovery_rows": [],      # 신상품 발굴 분석 결과 캐시
+        "_vendor_items_cache": [],  # 원가비교 페이지 업로드 데이터 캐시 (페이지 이동해도 유지)
         "_vendor_compare_summary": {},  # 원가비교에서 추출된 품목별 동시 취급 업체 수
     }
     for k, v in defaults.items():
@@ -441,14 +442,21 @@ def parse_delivery_excel(uploaded_file) -> list:
 # 중량 패턴: "1kg", "500g", "10kg" 등 (숫자+단위를 그대로 캡처)
 _WEIGHT_PATTERN = re.compile(r'\d+(\.\d+)?\s?(kg|KG|Kg|g|G|ml|ML)\b')
 
+# 곱하기/묶음 표기: "500g x 2", "500g*2", "2팩" 등 — 다팩 구성을 별도 태그로 보존
+_MULTIPLIER_PATTERN = re.compile(r'[*xX×]\s?\d+\s?(팩|포|봉|개)?')
+
 # 개당 낱개 중량: "개당 30g내외" 처럼 진짜 박스 중량(1kg)과 별개로, 알맹이 하나의 크기를 나타내는 표기
 # (개당 중량이 클수록 같은 등급이어도 더 굵은 과실 — 등급을 못 잡을 때 대체 비교 지표로 사용)
 _UNIT_WEIGHT_PATTERN = re.compile(r'개당\s?\d+(\.\d+)?\s?(g|kg|G|KG)')
 
-# 개수구간 패턴: "13-16과", "8-12과 내외", "18과", "13과내외", "1번과"/"1번"/"3-4번"(등급을 숫자로 매긴 표기) 등
+# 밀리미터 사이즈코드: 블루베리 등 알 크기를 "14-16mm", "18 20mm"처럼 표기
+_MM_SIZE_PATTERN = re.compile(r'(\d+)\s?-?\s?(\d*)\s?mm', re.IGNORECASE)
+
+# 개수구간 패턴: "13-16과", "8-12과 내외", "18과", "13과내외", "1번과"/"1번"/"3-4번"(등급을 숫자로 매긴 표기),
+# "2팩"/"3포"/"1봉"(낱개 포장단위) 등
 # 한글은 단어경계(\b)가 인식 안 되는 경우가 많아 \b를 쓰지 않음 (예: "13과내외"에서 과/내 사이는 경계가 아님)
-_COUNT_RANGE_PATTERN = re.compile(r'\d+\s?[-~]\s?\d+\s?(번과|번|과|개|미|입|구|수)')
-_COUNT_SINGLE_PATTERN = re.compile(r'\d+\s?(번과|번|과|개|미|입|구|수)')
+_COUNT_RANGE_PATTERN = re.compile(r'\d+\s?[-~]\s?\d+\s?(번과|번|과|개|미|입|구|수|팩|포|봉)')
+_COUNT_SINGLE_PATTERN = re.compile(r'\d+\s?(번과|번|과|개|미|입|구|수|팩|포|봉)')
 
 # 감귤류 영문 사이즈코드: "2S", "S-M", "3L", "S,M,L"(여러 사이즈 혼합) 등
 _CITRUS_SIZE_PATTERN = re.compile(r'(?<![A-Za-z0-9])([23]?[SML])(?:[-,/][23]?[SML])*(?![A-Za-z0-9])')
@@ -466,8 +474,8 @@ _SIZE_GRADE_WORDS = ['특대과', '중대과', '중소과', '소중과', '왕왕
 # 사이즈와 무관한 '타입/형태' 태그 — 등급과 별도로 함께 표시 (둘 다 동시에 있을 수 있음, 예: "소과 + 가정용")
 _TYPE_TAGS = ['실속', '못난이', '정품', '가정용', '혼합', '랜덤', 'A급']
 
-# 1글자 등급(하/중/상/특)은 공백으로 독립된 토큰일 때만 인정 (다른 단어 속 글자와 혼동 방지)
-_GRADE_SINGLE_PATTERN = re.compile(r'(?:^|\s)([하중상특])(?:\s|$)')
+# 1글자 등급(하/중/상/특/대/소)은 공백으로 독립된 토큰일 때만 인정 (다른 단어 속 글자와 혼동 방지)
+_GRADE_SINGLE_PATTERN = re.compile(r'(?:^|\s)([하중상특대소])(?:\s|$)')
 
 # 품목명에서만 제거할 마케팅성 잡음 (수량/중량/등급은 절대 건드리지 않음)
 _NOISE_WORDS = ['신규', 'NEW', 'New', 'new', '특가', '핫딜', '한정', '프리미엄', '단독', '이벤트',
@@ -496,7 +504,7 @@ def parse_product_variant(full_name: str) -> dict:
     """
     상품명(+옵션명) 원문에서 품목명/중량/등급/개수구간/사이즈코드/포장형태를 각각 분리 추출.
     추출 순서대로 텍스트에서 잘라내며 진행하므로(겹침 방지), 추출 순서가 중요함:
-    포장형태 → 개당중량 → 중량(kg/g) → 감귤사이즈코드 → 개수구간 → 등급
+    포장형태 → 곱하기묶음 → 개당중량 → 중량(kg/g) → mm사이즈 → 감귤사이즈코드 → 개수구간 → 등급
     """
     raw = str(full_name)
 
@@ -506,6 +514,12 @@ def parse_product_variant(full_name: str) -> dict:
     work = _strip_noise(raw)
     if package:
         work = work.replace(package, ' ')
+
+    # 곱하기/묶음 표기 (예: "500g x 2", "500g*2", "*2팩") — 다팩 구성 별도 태그로 보존
+    mult_m = _MULTIPLIER_PATTERN.search(work)
+    multiplier = re.sub(r'\s+', '', mult_m.group(0)) if mult_m else ""
+    if mult_m:
+        work = work[:mult_m.start()] + ' ' + work[mult_m.end():]
 
     # 개당 낱개 중량 (예: "개당 30g내외") — 진짜 박스 중량(kg)보다 먼저 추출해야 "30g"이 중량으로 오인식 안 됨
     unit_w_m = _UNIT_WEIGHT_PATTERN.search(work)
@@ -517,6 +531,14 @@ def parse_product_variant(full_name: str) -> dict:
     weight = weight_m.group(0).replace(' ', '') if weight_m else ""
     if weight_m:
         work = work[:weight_m.start()] + ' ' + work[weight_m.end():]
+
+    # mm 사이즈코드 (블루베리 등 알 크기 표기, 예: "18-20mm") — kg/L 단위와 안 겹치므로 중량 다음에 추출
+    mm_m = _MM_SIZE_PATTERN.search(work)
+    if mm_m:
+        mm_size = f"{mm_m.group(1)}-{mm_m.group(2)}mm" if mm_m.group(2) else f"{mm_m.group(1)}mm"
+        work = work[:mm_m.start()] + ' ' + work[mm_m.end():]
+    else:
+        mm_size = ""
 
     size_m = _CITRUS_SIZE_PATTERN.search(work)
     citrus_size = size_m.group(0).replace(' ', '') if size_m else ""
@@ -551,17 +573,19 @@ def parse_product_variant(full_name: str) -> dict:
             work = work.replace(t, ' ')
             break
 
-    base = re.sub(r'[()\[\]{}~/_,]', ' ', work)
+    base = re.sub(r'[()\[\]{}~/_,*xX×]', ' ', work)
     for w in _LOCATION_STOPWORDS:
         base = base.replace(w, ' ')
     base = re.sub(r'\s+', ' ', base).strip()
 
-    # 비교 표시용 규격 라벨: "1kg 소과" / "S-M" / "1kg 중 (개당30g)" / "10kg 혼합 📦선물박스" 등
-    spec_parts = [p for p in [weight, grade, type_tag, citrus_size] if p]
+    # 비교 표시용 규격 라벨: "1kg 소과" / "S-M" / "1kg 중 (개당30g)" / "18-20mm" / "10kg 혼합 📦선물박스" 등
+    spec_parts = [p for p in [weight, grade, type_tag, citrus_size, mm_size] if p]
     if unit_weight:
         spec_parts.append(f"({unit_weight})")
     if count and count != grade:
         spec_parts.append(f"({count})")
+    if multiplier:
+        spec_parts.append(multiplier)
     if package:
         spec_parts.append(f"📦{package}")
     spec_label = " ".join(spec_parts) if spec_parts else "규격미상"
@@ -1753,53 +1777,65 @@ def render_sourcing_page():
     )
 
     if not uploaded_files:
-        st.info(
-            "💡 '사과', '시나노사과'처럼 다른 품종은 따로 유지하고, 같은 품목이어도 "
-            "**1kg/2kg, 대과/중과/소과처럼 규격이 다르면 별도 행으로 분리해서** 도매처별 원가를 비교해드립니다."
-        )
-        return
-
-    def _guess(colnames, keys):
-        for c in colnames:
-            if any(k in str(c) for k in keys):
-                return c
-        return colnames[0]
-
-    all_items = []
-    for f in uploaded_files:
-        df_preview = pd.read_excel(f)
-        cols = list(df_preview.columns)
-
-        vendor_name = f.name.rsplit(".", 1)[0]
-        name_col = _guess(cols, ["상품명"])
-        opt_match = next((c for c in cols if "옵션명" in str(c)), None)
-        option_col = opt_match if opt_match else "(없음)"
-        price_col = _guess(cols, ["공급가", "원가"])
-
-        with st.expander(f"📄 {f.name} — 컬럼 매칭 확인 (자동 인식됨, 틀렸을 때만 펼쳐서 수정)", expanded=False):
-            st.dataframe(df_preview.head(3), use_container_width=True)
-
-            vendor_name = st.text_input(
-                "이 파일의 도매처 이름", value=vendor_name, key=f"sc_vendor_{f.name}"
+        cached = st.session_state.get("_vendor_items_cache") or []
+        if cached:
+            all_items = cached
+            cc1, cc2 = st.columns([4, 1])
+            cc1.success(f"📦 이전에 업로드한 데이터를 사용 중입니다 (총 {len(all_items)}개 항목). 새 파일을 올리면 자동으로 갱신돼요.")
+            if cc2.button("🗑️ 초기화", use_container_width=True):
+                st.session_state._vendor_items_cache = []
+                st.rerun()
+        else:
+            st.info(
+                "💡 '사과', '시나노사과'처럼 다른 품종은 따로 유지하고, 같은 품목이어도 "
+                "**1kg/2kg, 대과/중과/소과처럼 규격이 다르면 별도 행으로 분리해서** 도매처별 원가를 비교해드립니다."
             )
-            cc1, cc2, cc3 = st.columns(3)
-            name_col = cc1.selectbox(
-                "품목명 컬럼", cols, index=cols.index(name_col), key=f"sc_name_{f.name}"
-            )
-            opt_options = ["(없음)"] + cols
-            option_col = cc2.selectbox(
-                "옵션명 컬럼 (있으면 — 품목명과 합쳐서 분석)", opt_options,
-                index=opt_options.index(option_col),
-                key=f"sc_opt_{f.name}",
-            )
-            price_col = cc3.selectbox(
-                "원가(공급가) 컬럼", cols, index=cols.index(price_col), key=f"sc_price_{f.name}"
-            )
+            return
+    else:
+        def _guess(colnames, keys):
+            for c in colnames:
+                if any(k in str(c) for k in keys):
+                    return c
+            return colnames[0]
 
-        f.seek(0)
-        items = parse_vendor_excel(f, vendor_name, name_col, option_col, price_col)
-        all_items.extend(items)
-        st.caption(f"✅ {f.name}: {len(items)}개 항목 인식 (도매처: {vendor_name})")
+        all_items = []
+        for f in uploaded_files:
+            df_preview = pd.read_excel(f)
+            cols = list(df_preview.columns)
+
+            vendor_name = f.name.rsplit(".", 1)[0]
+            name_col = _guess(cols, ["상품명"])
+            opt_match = next((c for c in cols if "옵션명" in str(c)), None)
+            option_col = opt_match if opt_match else "(없음)"
+            price_col = _guess(cols, ["공급가", "원가"])
+
+            with st.expander(f"📄 {f.name} — 컬럼 매칭 확인 (자동 인식됨, 틀렸을 때만 펼쳐서 수정)", expanded=False):
+                st.dataframe(df_preview.head(3), use_container_width=True)
+
+                vendor_name = st.text_input(
+                    "이 파일의 도매처 이름", value=vendor_name, key=f"sc_vendor_{f.name}"
+                )
+                cc1, cc2, cc3 = st.columns(3)
+                name_col = cc1.selectbox(
+                    "품목명 컬럼", cols, index=cols.index(name_col), key=f"sc_name_{f.name}"
+                )
+                opt_options = ["(없음)"] + cols
+                option_col = cc2.selectbox(
+                    "옵션명 컬럼 (있으면 — 품목명과 합쳐서 분석)", opt_options,
+                    index=opt_options.index(option_col),
+                    key=f"sc_opt_{f.name}",
+                )
+                price_col = cc3.selectbox(
+                    "원가(공급가) 컬럼", cols, index=cols.index(price_col), key=f"sc_price_{f.name}"
+                )
+
+            f.seek(0)
+            items = parse_vendor_excel(f, vendor_name, name_col, option_col, price_col)
+            all_items.extend(items)
+            st.caption(f"✅ {f.name}: {len(items)}개 항목 인식 (도매처: {vendor_name})")
+
+        # 페이지를 이동했다 돌아와도 다시 업로드 안 해도 되게 세션에 캐싱
+        st.session_state._vendor_items_cache = all_items
 
     if not all_items:
         return
