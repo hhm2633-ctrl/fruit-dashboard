@@ -282,14 +282,25 @@ def fetch_coupang_orders(access_key: str, secret_key: str, vendor_id: str,
     headers_dict = {
         "Authorization": auth,
         "Content-Type":  "application/json;charset=UTF-8",
+        # 서버가 gzip으로 응답할 수 있어 명시적으로 비압축 요청
+        # (그래도 gzip이 올 수 있어 아래에서 Content-Encoding을 확인해 안전하게 처리)
+        "Accept-Encoding": "identity",
     }
 
     # http.client 사용 → URL 재인코딩 없이 정확히 전송
     conn = http.client.HTTPSConnection(HOST, timeout=10)
     conn.request("GET", f"{path}?{qs}", headers=headers_dict)
     resp = conn.getresponse()
-    resp_body = resp.read().decode("utf-8")
+    raw_body = resp.read()
     conn.close()
+
+    # 응답이 gzip으로 압축되어 온 경우 압축 해제
+    content_encoding = resp.getheader("Content-Encoding", "").lower()
+    if content_encoding == "gzip" or raw_body[:2] == b"\x1f\x8b":
+        import gzip
+        raw_body = gzip.decompress(raw_body)
+
+    resp_body = raw_body.decode("utf-8")
 
     if resp.status != 200:
         raise Exception(f"HTTP 오류 {resp.status}: {resp_body[:400]}")
