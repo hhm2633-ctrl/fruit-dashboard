@@ -133,6 +133,10 @@ def _init():
         "_synced_from_sheet": False,  # 앱 시작 시 구글시트에서 1회 자동 불러오기 여부
         "_pm_edit_idx": None,       # 현재 수정 중인 상품 마스터 인덱스
         "_pm_form_key": 0,          # 상품 추가 폼 리셋 카운터 (등록 성공 시에만 증가)
+        "naver_client_id":     _secret("naver_client_id"),
+        "naver_client_secret": _secret("naver_client_secret"),
+        "_discovery_rows": [],      # 신상품 발굴 분석 결과 캐시
+        "_vendor_compare_summary": {},  # 원가비교에서 추출된 품목별 동시 취급 업체 수
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1180,23 +1184,359 @@ def render_sidebar():
 
 
 # ══════════════════════════════════════════
+#  신상품 발굴 — 네이버 데이터랩(트렌드) + 네이버쇼핑(시장가) 분석
+# ══════════════════════════════════════════
+NAVER_DATALAB_URL = "https://openapi.naver.com/v1/datalab/search"
+NAVER_SHOP_URL = "https://openapi.naver.com/v1/search/shop.json"
+
+# 채널별 수수료 (필요시 화면에서 직접 조정 가능)
+_CHANNEL_FEES_DEFAULT = {
+    "쿠팡": 0.108,
+    "네이버 스마트스토어": 0.0374 + 0.02,
+    "G마켓": 0.13,
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_naver_trend_batch(keywords: tuple, client_id: str, client_secret: str, time_unit: str = "month") -> dict:
+    """네이버 데이터랩으로 키워드별 최근 2년 검색 트렌드 조회 (5개씩 묶어서 호출).
+    time_unit: 'date'(일간) / 'week'(주간) / 'month'(월간)
+    """
+    end_date = datetime.date.today()
+    start_date = end_date - datetime.timedelta(days=2 * 365)
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+        "Content-Type": "application/json",
+    }
+    all_results, errors = [], []
+    items = list(keywords)
+    for i in range(0, len(items), 5):
+        chunk = items[i:i + 5]
+        keyword_groups = [{"groupName": name, "keywords": [name]} for name in chunk]
+        body = {
+            "startDate": start_date.strftime("%Y-%m-%d"),
+            "endDate": end_date.strftime("%Y-%m-%d"),
+            "timeUnit": time_unit,
+            "keywordGroups": keyword_groups,
+        }
+        try:
+            resp = requests.post(NAVER_DATALAB_URL, headers=headers, data=json.dumps(body), timeout=10)
+            if resp.status_code != 200:
+                errors.append(f"{resp.status_code} {resp.text[:150]}")
+                continue
+            all_results.extend(resp.json().get("results", []))
+        except Exception as e:
+            errors.append(str(e))
+    return {"results": all_results, "errors": errors}
+
+
+def circular_month_distance(m1: int, m2: int) -> int:
+    d = abs(m1 - m2) % 12
+    return min(d, 12 - d)
+
+
+def analyze_seasonality(trend_data: dict, keyword: str) -> dict:
+    """월별 검색량 평균을 내서 피크월/에버그린 여부/최근 모멘텀(상승·하락세)을 판정."""
+    # 공백/대소문자 차이로 매칭 실패하는 걸 막기 위해 느슨하게 비교
+    norm = lambda s: re.sub(r'\s+', '', str(s)).lower()
+    results_by_title = {norm(r.get("title")): r for r in trend_data.get("results", [])}
+    r = results_by_title.get(norm(keyword))
+    data_points = r.get("data", []) if r else []
+
+    if r is None:
+        return {"ok": False, "peak_month": None, "is_evergreen": False, "momentum": 0.0,
+                "debug": "⚠️ API 응답에서 이 키워드를 찾지 못함 (네이버 데이터랩 매칭 실패)"}
+    if not data_points or len(data_points) < 6:
+        return {"ok": False, "peak_month": None, "is_evergreen": False, "momentum": 0.0,
+                "debug": "데이터 부족 (최근 검색량 데이터가 6개월 미만)"}
+
+    monthly = defaultdict(list)
+    for d in data_points:
+        try:
+            m = int(d["period"].split("-")[1])
+        except (KeyError, IndexError, ValueError):
+            continue
+        monthly[m].append(d["ratio"])
+
+    if not monthly:
+        return {"ok": False, "peak_month": None, "is_evergreen": False, "momentum": 0.0, "debug": "월별 파싱 실패"}
+
+    monthly_avg = {m: sum(v) / len(v) for m, v in monthly.items()}
+    peak_month = max(monthly_avg, key=monthly_avg.get)
+
+    vals = list(monthly_avg.values())
+    mean_v = sum(vals) / len(vals)
+    std_v = (sum((x - mean_v) ** 2 for x in vals) / len(vals)) ** 0.5
+    cv = (std_v / mean_v) if mean_v > 0 else 0
+
+    last_point = data_points[-1]
+    current_ratio = last_point["ratio"]
+    try:
+        cur_month = int(last_point["period"].split("-")[1])
+    except (KeyError, IndexError, ValueError):
+        cur_month = peak_month
+    baseline = monthly_avg.get(cur_month, mean_v)
+    momentum = ((current_ratio - baseline) / baseline) if baseline > 0 else 0.0
+
+    return {
+        "ok": True,
+        "peak_month": peak_month,
+        "is_evergreen": cv < 0.25,   # 월별 편차가 작으면 '사계절 꾸준히 팔리는' 에버그린형으로 판정
+        "momentum": momentum,
+        "debug": f"피크 {peak_month}월, 변동계수 {cv:.2f}",
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_naver_shopping(query: str, client_id: str, client_secret: str) -> dict:
+    """네이버쇼핑 검색으로 시장 평균가·최저가·판매처 수 조회."""
+    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+    params = {"query": query, "display": 40, "sort": "sim"}
+    try:
+        resp = requests.get(NAVER_SHOP_URL, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            return {"error": f"{resp.status_code} {resp.text[:150]}"}
+        items = resp.json().get("items", [])
+        prices = [int(it["lprice"]) for it in items if str(it.get("lprice", "")).isdigit() and int(it["lprice"]) > 0]
+        if not prices:
+            return {"error": f"가격정보 없음 (검색결과 {len(items)}건)"}
+        malls = set(it.get("mallName", "") for it in items)
+        return {"avg_price": sum(prices) / len(prices), "min_price": min(prices), "mall_count": len(malls)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def render_discovery_page():
+    st.markdown(
+        '<div class="dash-header">'
+        "<h1>🔍 신상품 발굴</h1>"
+        "<p>여러 도매처가 동시에 취급 중인 품목(=지금 제철 신호) 자동 추출 → "
+        "월간 검색 트렌드로 2~3개월 뒤 피크 예상 품목 발굴</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    client_id = st.session_state.naver_client_id
+    client_secret = st.session_state.naver_client_secret
+
+    with st.expander("⚙️ 네이버 API 키 설정", expanded=not (client_id and client_secret)):
+        client_id = st.text_input("Client ID", value=client_id, key="inp_naver_id")
+        client_secret = st.text_input("Client Secret", value=client_secret, type="password", key="inp_naver_secret")
+        st.session_state.naver_client_id = client_id
+        st.session_state.naver_client_secret = client_secret
+        st.caption(
+            "💡 `.streamlit/secrets.toml`에 `naver_client_id`, `naver_client_secret`을 추가해두면 "
+            "새로고침해도 다시 입력 안 해도 됩니다."
+        )
+
+    if not client_id or not client_secret:
+        st.info("👆 네이버 API 키를 입력하면 분석을 시작할 수 있어요.")
+        return
+
+    # ── 분석 대상 자동 추출: 원가비교에서 여러 업체가 동시에 취급 중인 품목 = 지금 제철 신호 ──
+    summary = st.session_state._vendor_compare_summary
+    if not summary:
+        st.warning(
+            "⚠️ 아직 분석할 품목이 없습니다. 먼저 **💰 원가비교** 페이지에서 도매처 단가표 엑셀을 업로드해주세요. "
+            "거기서 추출된 품목이 여기 분석 대상으로 자동으로 들어옵니다."
+        )
+        return
+
+    max_vendor_count = max(s["vendor_count"] for s in summary.values())
+    st.markdown("#### 🔎 분석 대상 품목 (원가비교에서 자동 추출)")
+    min_vendors = st.slider(
+        "최소 동시 취급 업체 수 (여러 업체가 동시에 팔고 있을수록 '지금 제철'일 가능성이 높음)",
+        min_value=1, max_value=max(max_vendor_count, 1), value=min(2, max_vendor_count),
+    )
+    candidates = sorted(
+        [b for b, s in summary.items() if s["vendor_count"] >= min_vendors],
+        key=lambda b: -summary[b]["vendor_count"],
+    )
+    st.caption(f"📦 {min_vendors}개 이상 업체가 동시 취급 중인 품목: **{len(candidates)}개**")
+
+    MAX_ANALYZE = 30
+    selected = st.multiselect(
+        f"분석할 품목 선택 (자동으로 채워짐, 최대 {MAX_ANALYZE}개 권장 — 직접 추가/제외 가능)",
+        options=sorted(summary.keys()),
+        default=candidates[:MAX_ANALYZE],
+    )
+    if len(selected) > MAX_ANALYZE:
+        st.warning(f"⚠️ {MAX_ANALYZE}개 넘으면 API 호출이 많아져서 느려질 수 있어요. 가능하면 줄여주세요.")
+    st.caption(
+        "⚠️ 네이버 데이터랩은 **같은 요청에 묶인 최대 5개끼리만** 검색량을 직접 비교할 수 있어요. "
+        "5개씩 끊어서 조회되며, 묶음번호가 다르면 절대적인 인기도는 직접 비교가 안 됩니다 (묶음 안에서는 정확)."
+    )
+
+    target_margin = st.slider("목표 순마진율 구간 (%)", 0, 60, (18, 40))
+
+    with st.expander("⚙️ 채널 수수료율 조정"):
+        channel_fees = {}
+        for name, default in _CHANNEL_FEES_DEFAULT.items():
+            pct = st.number_input(name, 0.0, 50.0, round(default * 100, 2), 0.1, key=f"disc_fee_{name}")
+            channel_fees[name] = pct / 100
+
+    if st.button("🔍 월간 트렌드·시장가 분석 시작", type="primary", use_container_width=True):
+        keywords = selected
+        if not keywords:
+            st.error("분석할 품목을 선택해주세요.")
+        else:
+            with st.spinner(f"{len(keywords)}개 품목 월간 트렌드 분석 중… (네이버 데이터랩 + 쇼핑 조회)"):
+                trend_data = fetch_naver_trend_batch(tuple(keywords), client_id, client_secret, time_unit="month")
+                today = datetime.date.today()
+                current_month = today.month
+                rows = []
+                for idx, kw in enumerate(keywords):
+                    batch_no = idx // 5 + 1  # 5개씩 묶여서 호출되므로, 같은 묶음번호끼리만 인기도 직접비교 가능
+                    season = analyze_seasonality(trend_data, kw)
+                    shop = fetch_naver_shopping(kw, client_id, client_secret)
+
+                    momentum = season["momentum"] if season["ok"] else None
+                    not_declining = (momentum is None) or (momentum > -0.15)
+
+                    if not season["ok"]:
+                        fit = f"❓ 판단불가 — {season['debug']}"
+                    elif season["is_evergreen"]:
+                        fit = "🌱 에버그린형" if not_declining else "🌱 에버그린(하락세)"
+                    elif season["peak_month"] is not None:
+                        # 2~3개월 뒤(다가오는 시즌)를 내다보고 피크 적합도 판정
+                        dist = min(
+                            circular_month_distance(season["peak_month"], (current_month + off - 1) % 12 + 1)
+                            for off in range(0, 3)
+                        )
+                        if dist <= 1:
+                            fit = "🌸 2~3개월 내 피크 예상" if not_declining else "🌸 피크 예상(하락세)"
+                        else:
+                            fit = f"⏳ 비시즌(피크 {season['peak_month']}월)"
+                    else:
+                        fit = "❓ 판단불가"
+
+                    row = {
+                        "품목": kw,
+                        "동시취급업체수": summary.get(kw, {}).get("vendor_count", "-"),
+                        "비교묶음": f"{batch_no}번",
+                        "시즌/적합도": fit,
+                        "모멘텀%": round(momentum * 100, 1) if momentum is not None else None,
+                    }
+
+                    # 원가: 상품마스터에 등록돼 있으면 그 값, 없으면 원가비교에서 찾은 최저원가로 추정
+                    cost = None
+                    for p in st.session_state.product_master:
+                        if kw in p["product_name"] or p["product_name"] in kw:
+                            cost = p["cost_price"]
+                            break
+                    if cost is None:
+                        cost = summary.get(kw, {}).get("min_cost")
+
+                    if "error" not in shop:
+                        avg = shop["avg_price"]
+                        row["시장평균가(원)"] = round(avg)
+                        row["판매처수"] = shop["mall_count"]
+                        best = None
+                        for ch, fee in channel_fees.items():
+                            if cost:
+                                m = (avg * (1 - fee) - cost) / avg * 100
+                                row[f"{ch} 마진%"] = round(m, 1)
+                                best = m if best is None else max(best, m)
+                            else:
+                                row[f"{ch} 마진%"] = "원가없음"
+                        lo, hi = target_margin
+                        if best is None:
+                            row["판정"] = "ℹ️ 원가 확인 불가"
+                        elif lo <= best <= hi:
+                            row["판정"] = "✅ 목표마진 충족"
+                        elif best > hi:
+                            row["판정"] = "💎 고마진"
+                        elif best < 0:
+                            row["판정"] = "🔴 역마진"
+                        else:
+                            row["판정"] = "⚠️ 마진부족"
+                        row["_best"] = best if best is not None else -1000
+                    else:
+                        row["시장평균가(원)"] = None
+                        row["판매처수"] = None
+                        row["판정"] = f"⚠️ 조회실패: {shop['error'][:40]}"
+                        row["_best"] = -1000
+
+                    row["_log"] = season.get("debug", "")
+                    row["_not_declining"] = not_declining
+                    rows.append(row)
+
+                st.session_state._discovery_rows = rows
+
+    if st.session_state._discovery_rows:
+        st.divider()
+        st.markdown("#### 📊 분석 결과")
+        rows = st.session_state._discovery_rows
+        df = pd.DataFrame(rows).sort_values("_best", ascending=False)
+        display_cols = [c for c in df.columns if not c.startswith("_")]
+        st.dataframe(df[display_cols].set_index("품목"), use_container_width=True)
+
+        lo, hi = target_margin
+        cond_fit = df["시즌/적합도"].isin(["🌸 2~3개월 내 피크 예상", "🌱 에버그린형"])
+        cond_margin = df["판정"].isin(["✅ 목표마진 충족", "💎 고마진"])
+        recommended = df[cond_fit & cond_margin & df["_not_declining"]]
+        st.markdown(f"##### 🏆 추천 품목 (시즌적합·에버그린 + 마진 {lo}~{hi}% 이상)")
+        if len(recommended) > 0:
+            st.dataframe(recommended[display_cols].set_index("품목"), use_container_width=True)
+        else:
+            st.info("현재 조건을 충족하는 품목이 없습니다. 품목을 더 추가하거나 마진 구간을 조정해보세요.")
+
+        with st.expander("🔎 품목별 분석 로그 보기"):
+            for r in rows:
+                st.markdown(f"**{r['품목']}** — {r['_log']}")
+
+
+# ══════════════════════════════════════════
 #  메인 대시보드
 # ══════════════════════════════════════════
 def render_dashboard():
     # ── 헤더 ──
     st.markdown(
         '<div class="dash-header">'
-        "<h1>🍎 과일 발주 대시보드</h1>"
-        "<p>쿠팡 위탁판매 · 실시간 주문 수집 → 도매사별 발주 관리</p>"
+        "<h1>🛒 쿠팡 주문관리</h1>"
+        "<p>발주서 엑셀을 올리면 도매사별로 자동 분류해드립니다</p>"
         "</div>",
         unsafe_allow_html=True,
     )
 
-    # ── 액션 버튼 ──
-    col_a, col_b, col_c, col_d = st.columns([5, 4, 2, 2])
+    # ── 메인 액션: 엑셀(발주서) 업로드 ──
+    st.markdown("#### 📁 발주서 엑셀 업로드")
+    st.caption(
+        "쿠팡 Wing → 주문/배송 → 발주서 조회 → 엑셀 다운로드(DeliveryList_*.xlsx) 파일을 그대로 올려주세요."
+    )
+    if st.session_state.gsheet_url:
+        st.caption("☁️ 구글시트 연동 중 — 업로드한 주문은 자동 저장되어 새로고침해도 유지됩니다.")
 
-    with col_a:
-        if st.button("🔄 쿠팡 API 실시간 동기화", use_container_width=True, type="primary"):
+    uploaded = st.file_uploader(
+        "발주서 엑셀 파일 선택", type=["xlsx"], key="delivery_excel_uploader", label_visibility="collapsed"
+    )
+    uc1, uc2 = st.columns([3, 1])
+    with uc1:
+        if uploaded is not None:
+            if st.button("📥 업로드한 파일로 주문 불러오기", use_container_width=True, type="primary"):
+                try:
+                    orders = parse_delivery_excel(uploaded)
+                    if not orders:
+                        st.warning("⚠️ 파일에서 주문 데이터를 찾지 못했습니다. 파일 양식을 확인해주세요.")
+                    else:
+                        st.session_state.orders = orders
+                        try:
+                            save_orders_cache_to_sheet(orders)
+                        except Exception:
+                            pass
+                        st.success(f"✅ {len(orders)}건 주문을 엑셀에서 불러왔습니다!")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+    with uc2:
+        if st.button("🗑️ 초기화", use_container_width=True):
+            st.session_state.orders = []
+            st.rerun()
+
+    # ── 쿠팡 API 자동 동기화 (선택사항, 작게 접어둠) ──
+    with st.expander("🔄 쿠팡 API로 자동 동기화 (선택 — IP 화이트리스트 등록 필요)", expanded=False):
+        if st.button("API로 오늘 주문 동기화", use_container_width=True):
             ak = st.session_state.api_access_key
             sk = st.session_state.api_secret_key
             vid = st.session_state.api_vendor_id
@@ -1216,56 +1556,13 @@ def render_dashboard():
                     except Exception as e:
                         st.error(f"❌ {e}")
 
-    with col_b:
-        if st.button("🧪 가상 주문 데이터 테스트", use_container_width=True):
-            st.session_state.orders = generate_test_orders()
-            st.success("✅ 테스트 주문 10건 생성 완료!")
-            st.rerun()
-
-    with col_c:
-        if st.button("🌐 서버 IP 확인", use_container_width=True, help="쿠팡 WING에 등록할 서버 IP"):
-            with st.spinner("IP 확인 중…"):
-                ip = get_server_ip()
-            st.info(f"**서버 IP:** `{ip}`\n\n쿠팡 WING → 연동 정보수정에 이 IP를 등록하세요.")
-
-    with col_d:
-        if st.button("🗑️ 초기화", use_container_width=True):
-            st.session_state.orders = []
-            st.rerun()
-
-    # ── 엑셀(발주서) 업로드: API IP 미등록/오류 시 대체 수단 ──
-    with st.expander("📁 엑셀로 주문 가져오기 (쿠팡 Wing 발주서 조회 다운로드 파일)", expanded=False):
-        st.caption(
-            "쿠팡 Wing → 주문/배송 → 발주서 조회 → 엑셀 다운로드(DeliveryList_*.xlsx) 파일을 그대로 올려주세요. "
-            "API 연동이 안 되는 환경에서도 동일하게 도매사별 자동 분류가 적용됩니다."
-        )
-        if st.session_state.gsheet_url:
-            st.caption("☁️ 구글시트 연동 중 — 업로드한 주문은 자동 저장되어 새로고침해도 유지됩니다.")
-        uploaded = st.file_uploader("발주서 엑셀 파일 선택", type=["xlsx"], key="delivery_excel_uploader")
-        if uploaded is not None:
-            if st.button("📥 업로드한 파일로 주문 불러오기", use_container_width=True, type="primary"):
-                try:
-                    orders = parse_delivery_excel(uploaded)
-                    if not orders:
-                        st.warning("⚠️ 파일에서 주문 데이터를 찾지 못했습니다. 파일 양식을 확인해주세요.")
-                    else:
-                        st.session_state.orders = orders
-                        try:
-                            save_orders_cache_to_sheet(orders)
-                        except Exception:
-                            pass
-                        st.success(f"✅ {len(orders)}건 주문을 엑셀에서 불러왔습니다!")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"❌ {e}")
-
     # ── 주문 없음 안내 ──
     if not st.session_state.orders:
         st.markdown(
             "<br><div style='text-align:center;color:#94a3b8;padding:60px 0'>"
             "<div style='font-size:56px'>📭</div>"
             "<h3>수집된 주문이 없습니다</h3>"
-            "<p>위 버튼으로 쿠팡 API를 동기화하거나 테스트 데이터를 생성해보세요.</p>"
+            "<p>위에서 발주서 엑셀을 업로드해주세요.</p>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1444,7 +1741,7 @@ def render_dashboard():
 def render_sourcing_page():
     st.markdown(
         '<div class="dash-header">'
-        "<h1>🔍 신상품 발굴 · 원가 비교</h1>"
+        "<h1>💰 원가비교</h1>"
         "<p>도매처별 단가표 업로드 → 품목명은 같게, 중량·등급·개수구간은 정확히 분리해서 비교</p>"
         "</div>",
         unsafe_allow_html=True,
@@ -1473,31 +1770,36 @@ def render_sourcing_page():
         df_preview = pd.read_excel(f)
         cols = list(df_preview.columns)
 
-        with st.expander(f"📄 {f.name} — 컬럼 매칭 확인", expanded=True):
+        vendor_name = f.name.rsplit(".", 1)[0]
+        name_col = _guess(cols, ["상품명"])
+        opt_match = next((c for c in cols if "옵션명" in str(c)), None)
+        option_col = opt_match if opt_match else "(없음)"
+        price_col = _guess(cols, ["공급가", "원가"])
+
+        with st.expander(f"📄 {f.name} — 컬럼 매칭 확인 (자동 인식됨, 틀렸을 때만 펼쳐서 수정)", expanded=False):
             st.dataframe(df_preview.head(3), use_container_width=True)
 
             vendor_name = st.text_input(
-                "이 파일의 도매처 이름", value=f.name.rsplit(".", 1)[0], key=f"sc_vendor_{f.name}"
+                "이 파일의 도매처 이름", value=vendor_name, key=f"sc_vendor_{f.name}"
             )
             cc1, cc2, cc3 = st.columns(3)
             name_col = cc1.selectbox(
-                "품목명 컬럼", cols, index=cols.index(_guess(cols, ["상품명"])), key=f"sc_name_{f.name}"
+                "품목명 컬럼", cols, index=cols.index(name_col), key=f"sc_name_{f.name}"
             )
             opt_options = ["(없음)"] + cols
-            opt_match = next((c for c in cols if "옵션명" in str(c)), None)
             option_col = cc2.selectbox(
                 "옵션명 컬럼 (있으면 — 품목명과 합쳐서 분석)", opt_options,
-                index=opt_options.index(opt_match if opt_match else "(없음)"),
+                index=opt_options.index(option_col),
                 key=f"sc_opt_{f.name}",
             )
             price_col = cc3.selectbox(
-                "원가(공급가) 컬럼", cols, index=cols.index(_guess(cols, ["공급가", "원가"])), key=f"sc_price_{f.name}"
+                "원가(공급가) 컬럼", cols, index=cols.index(price_col), key=f"sc_price_{f.name}"
             )
 
         f.seek(0)
         items = parse_vendor_excel(f, vendor_name, name_col, option_col, price_col)
         all_items.extend(items)
-        st.caption(f"✅ {len(items)}개 항목 인식")
+        st.caption(f"✅ {f.name}: {len(items)}개 항목 인식 (도매처: {vendor_name})")
 
     if not all_items:
         return
@@ -1507,21 +1809,48 @@ def render_sourcing_page():
     total_specs = sum(len(specs) for specs in tree.values())
     st.success(f"총 {len(all_items)}개 항목 → **{len(tree)}개 품목 · {total_specs}개 규격(중량×등급)**으로 정리되었습니다.")
 
-    # ── 품목 검색 ──
+    # 신상품 발굴 페이지에서 쓸 수 있도록, 품목별 '동시 취급 업체 수' 요약을 세션에 저장
+    # (여러 업체가 동시에 취급 중 = 지금 시중에 풀린 제철 신호로 간주)
+    summary = {}
+    for base, specs in tree.items():
+        vendors = set()
+        all_costs = []
+        for spec_vendors in specs.values():
+            for v, c in spec_vendors.items():
+                if v == "_원본예시":
+                    continue
+                vendors.add(v)
+                all_costs.append(c)
+        summary[base] = {
+            "vendor_count": len(vendors),
+            "vendors": sorted(vendors),
+            "min_cost": min(all_costs) if all_costs else None,
+        }
+    st.session_state._vendor_compare_summary = summary
+
+    # ── 품목 검색 (검색하기 전에는 비교 카드를 그리지 않음 — 미리 다 그리면 느려짐) ──
     st.markdown("#### 🔎 품목 검색")
     search = st.text_input(
         "품목명을 입력하면 그 품목의 모든 규격을 도매처별로 비교해서 보여드립니다",
-        "", placeholder="예: 시나노사과",
+        "", placeholder="예: 시나노사과 (입력 후 Enter)",
         label_visibility="collapsed",
     )
 
-    if search.strip():
-        base_names = [b for b in tree if search.strip() in b]
-        st.caption(f"'{search.strip()}' 검색결과 {len(base_names)}개 품목")
-    else:
-        base_names = sorted(tree.keys(), key=lambda b: -len(tree[b]))
-        st.caption(f"전체 {len(base_names)}개 품목 중 규격 종류 많은 순 상위 30개 표시 (검색하면 전체에서 찾습니다)")
-        base_names = base_names[:30]
+    if not search.strip():
+        st.info("👆 검색어를 입력하면 그 품목의 도매처별 규격 비교표가 여기 표시됩니다.")
+        return
+
+    base_names = [b for b in tree if search.strip() in b]
+    st.caption(f"'{search.strip()}' 검색결과 {len(base_names)}개 품목")
+
+    if not base_names:
+        st.warning("검색 결과가 없습니다. 다른 키워드로 시도해보세요.")
+        return
+
+    MAX_RESULTS = 20
+    if len(base_names) > MAX_RESULTS:
+        st.caption(f"⚠️ 결과가 많아 상위 {MAX_RESULTS}개만 표시합니다. 더 구체적인 키워드로 검색해보세요.")
+        base_names = base_names[:MAX_RESULTS]
 
     def _highlight_cheapest(row, vendor_cols):
         """행에서 최저가 셀은 초록, 최고가 셀은 옅은 빨강으로 표시."""
@@ -1638,23 +1967,41 @@ def main():
             pass  # 연동 설정이 미완료여도 앱은 정상 동작
         st.session_state._synced_from_sheet = True
 
-    # 사이드바는 두 페이지 공통으로 항상 표시
+    # 사이드바는 공통으로 항상 표시
     render_sidebar()
 
-    # 상단 가로 탭으로 페이지 전환
-    page = st.radio(
-        "페이지 선택",
-        ["📦 주문 관리", "🔍 신상품 발굴"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="top_page_nav",
-    )
+    # 상단 3버튼 네비게이션 (페이지 전환 + 주요 액션을 겸함)
+    if "current_page" not in st.session_state:
+        st.session_state.current_page = "order"
+
+    nc1, nc2, nc3 = st.columns(3)
+    if nc1.button(
+        "🛒 쿠팡 주문관리", use_container_width=True,
+        type="primary" if st.session_state.current_page == "order" else "secondary",
+    ):
+        st.session_state.current_page = "order"
+        st.rerun()
+    if nc2.button(
+        "💰 원가비교", use_container_width=True,
+        type="primary" if st.session_state.current_page == "compare" else "secondary",
+    ):
+        st.session_state.current_page = "compare"
+        st.rerun()
+    if nc3.button(
+        "🔍 신상품 발굴", use_container_width=True,
+        type="primary" if st.session_state.current_page == "discovery" else "secondary",
+    ):
+        st.session_state.current_page = "discovery"
+        st.rerun()
+
     st.divider()
 
-    if page == "📦 주문 관리":
+    if st.session_state.current_page == "order":
         render_dashboard()
-    else:
+    elif st.session_state.current_page == "compare":
         render_sourcing_page()
+    else:
+        render_discovery_page()
 
 
 if __name__ == "__main__":
