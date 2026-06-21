@@ -157,6 +157,21 @@ def _get_password() -> str:
         return "fruit2024!"
 
 
+def _auth_token() -> str:
+    """현재 비밀번호로부터 만들어지는 고정 토큰. URL에 담아두면 새로고침(F5)해도 로그인 유지됨."""
+    return hashlib.sha256(("fruit-dashboard-auth-" + _get_password()).encode("utf-8")).hexdigest()[:24]
+
+
+def _check_url_auth():
+    """URL의 인증 토큰이 유효하면 세션을 자동으로 로그인 상태로 만듦 (F5 새로고침 대응)."""
+    try:
+        token = st.query_params.get("k")
+    except Exception:
+        token = None
+    if token and token == _auth_token():
+        st.session_state.logged_in = True
+
+
 def login_page():
     """로그인 UI만 렌더링하고 False를 반환."""
     st.markdown(
@@ -178,6 +193,10 @@ def login_page():
             if st.button("로그인", use_container_width=True, type="primary"):
                 if pw == _get_password():
                     st.session_state.logged_in = True
+                    try:
+                        st.query_params["k"] = _auth_token()
+                    except Exception:
+                        pass
                     st.rerun()
                 else:
                     st.error("❌ 비밀번호가 올바르지 않습니다.")
@@ -971,48 +990,6 @@ def _render_product_master_panel():
         if p.get("wholesale_name"):
             existing_wholesalers[p["wholesale_name"]] = p.get("wholesale_url", "")
 
-    # ── 상품 수정 폼 (목록에서 ✏️ 누르면 여기에 표시) ──
-    edit_idx = st.session_state._pm_edit_idx
-    if edit_idx is not None and 0 <= edit_idx < len(st.session_state.product_master):
-        p = st.session_state.product_master[edit_idx]
-        with st.expander(f"✏️ 상품 수정 — {p['product_name']}", expanded=True):
-            with st.form(f"edit_form_{edit_idx}"):
-                e_oid   = st.text_input("🔑 쿠팡등록번호(옵션ID)*", value=p["option_id"])
-                e_pname = st.text_input("📦 제품이름*", value=p["product_name"])
-                e_cost  = st.number_input("💰 원가(도매가, 원)", min_value=0, value=p["cost_price"], step=500)
-                e_sale  = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=p["sale_price"], step=500)
-                e_fee   = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=p["fee_rate"], step=0.1)
-                e_wname = st.text_input("🏪 도매사 이름*", value=p["wholesale_name"])
-                e_wurl  = st.text_input("🔗 도매 주문 페이지 URL", value=p["wholesale_url"])
-
-                ec1, ec2 = st.columns(2)
-                save_clicked   = ec1.form_submit_button("💾 수정 저장", use_container_width=True, type="primary")
-                cancel_clicked = ec2.form_submit_button("취소", use_container_width=True)
-
-                if save_clicked:
-                    if not e_oid or not e_pname or not e_wname:
-                        st.error("* 표시 필드는 필수입니다.")
-                    else:
-                        st.session_state.product_master[edit_idx] = {
-                            "option_id":     e_oid,
-                            "product_name":  e_pname,
-                            "cost_price":    e_cost,
-                            "sale_price":    e_sale,
-                            "fee_rate":      e_fee,
-                            "wholesale_name":e_wname,
-                            "wholesale_url": e_wurl,
-                        }
-                        try:
-                            save_product_master_to_sheet()
-                        except Exception:
-                            pass
-                        st.session_state._pm_edit_idx = None
-                        st.success("✅ 수정 완료!")
-                        st.rerun()
-                if cancel_clicked:
-                    st.session_state._pm_edit_idx = None
-                    st.rerun()
-
     # 상품 추가 폼
     with st.expander("➕ 상품 추가", expanded=True):
         default_wname, default_wurl = "", ""
@@ -1093,6 +1070,49 @@ def _render_product_master_panel():
                     pass
                 st.success(f"✅ {len(affected)}개 상품을 '{dst_name}' 으로 병합했습니다!")
                 st.rerun()
+
+    # ── 상품 수정 폼 (목록에서 ✏️ 누르면 바로 이 자리, 목록 바로 위에 표시됨) ──
+    edit_idx = st.session_state._pm_edit_idx
+    if edit_idx is not None and 0 <= edit_idx < len(st.session_state.product_master):
+        p = st.session_state.product_master[edit_idx]
+        with st.container(border=True):
+            st.markdown(f"##### ✏️ 상품 수정 — {p['product_name']}")
+            with st.form(f"edit_form_{edit_idx}"):
+                e_oid   = st.text_input("🔑 쿠팡등록번호(옵션ID)*", value=p["option_id"])
+                e_pname = st.text_input("📦 제품이름*", value=p["product_name"])
+                e_cost  = st.number_input("💰 원가(도매가, 원)", min_value=0, value=p["cost_price"], step=500)
+                e_sale  = st.number_input("🏷️ 쿠팡 판매가(원)", min_value=0, value=p["sale_price"], step=500)
+                e_fee   = st.number_input("📊 판매 수수료율(%)", min_value=0.0, max_value=100.0, value=p["fee_rate"], step=0.1)
+                e_wname = st.text_input("🏪 도매사 이름*", value=p["wholesale_name"])
+                e_wurl  = st.text_input("🔗 도매 주문 페이지 URL", value=p["wholesale_url"])
+
+                ec1, ec2 = st.columns(2)
+                save_clicked   = ec1.form_submit_button("💾 수정 저장", use_container_width=True, type="primary")
+                cancel_clicked = ec2.form_submit_button("취소", use_container_width=True)
+
+                if save_clicked:
+                    if not e_oid or not e_pname or not e_wname:
+                        st.error("* 표시 필드는 필수입니다.")
+                    else:
+                        st.session_state.product_master[edit_idx] = {
+                            "option_id":     e_oid,
+                            "product_name":  e_pname,
+                            "cost_price":    e_cost,
+                            "sale_price":    e_sale,
+                            "fee_rate":      e_fee,
+                            "wholesale_name":e_wname,
+                            "wholesale_url": e_wurl,
+                        }
+                        try:
+                            save_product_master_to_sheet()
+                        except Exception:
+                            pass
+                        st.session_state._pm_edit_idx = None
+                        st.success("✅ 수정 완료!")
+                        st.rerun()
+                if cancel_clicked:
+                    st.session_state._pm_edit_idx = None
+                    st.rerun()
 
     # 등록 상품 목록
     count = len(st.session_state.product_master)
@@ -1273,6 +1293,11 @@ def render_sidebar():
         if st.button("🚪 로그아웃", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.orders = []
+            try:
+                if "k" in st.query_params:
+                    del st.query_params["k"]
+            except Exception:
+                pass
             st.rerun()
 
 
@@ -1720,6 +1745,68 @@ def render_dashboard():
             # 미매핑 탭
             if label.startswith("❓"):
                 st.warning(f"⚠️ {len(unmatched)}건의 주문이 상품 마스터와 매핑되지 않았습니다.")
+
+                # ── 옵션ID별로 묶어서 한 번에 빠른 등록 (제목/판매가는 주문에서 자동으로 가져옴) ──
+                by_option = {}
+                for o in unmatched:
+                    by_option.setdefault(o["option_id"], []).append(o)
+
+                st.markdown("##### 🆕 옵션ID별 빠른 등록")
+                st.caption(
+                    "같은 옵션ID는 제목·판매가가 항상 동일하니 자동으로 채워드려요. "
+                    "원가(도매가)만 입력하고 저장하면, 해당 옵션ID의 주문 전체가 한 번에 분류됩니다."
+                )
+                existing_wholesalers = sorted({
+                    p["wholesale_name"] for p in st.session_state.product_master if p.get("wholesale_name")
+                })
+
+                for opt_id, orders_for_opt in by_option.items():
+                    sample = orders_for_opt[0]
+                    safe_key = re.sub(r'\W+', '_', opt_id)
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**{sample['product_name']}** "
+                            f"&nbsp; <small style='color:#94a3b8'>옵션ID `{opt_id}` · 이 옵션 주문 {len(orders_for_opt)}건</small>",
+                            unsafe_allow_html=True,
+                        )
+                        with st.form(f"quick_unmapped_{safe_key}"):
+                            qc1, qc2, qc3 = st.columns(3)
+                            q_cost = qc1.number_input("💰 원가(도매가)", min_value=0, value=0, step=500, key=f"um_cost_{safe_key}")
+                            q_fee = qc2.number_input("📊 수수료율(%)", min_value=0.0, max_value=100.0, value=10.8, step=0.1, key=f"um_fee_{safe_key}")
+                            q_sale = qc3.number_input("🏷️ 판매가(원)", min_value=0, value=int(sample["sale_price"]), step=500, key=f"um_sale_{safe_key}")
+
+                            if existing_wholesalers:
+                                q_wname = st.selectbox(
+                                    "🏪 도매처", existing_wholesalers + ["+ 새 도매처 직접 입력"], key=f"um_wpick_{safe_key}"
+                                )
+                                if q_wname == "+ 새 도매처 직접 입력":
+                                    q_wname = st.text_input("새 도매처 이름", key=f"um_wnew_{safe_key}")
+                            else:
+                                q_wname = st.text_input("🏪 도매처", key=f"um_wname_{safe_key}")
+                            q_wurl = st.text_input("🔗 도매 주문 페이지 URL", key=f"um_wurl_{safe_key}")
+
+                            if st.form_submit_button("✅ 등록", use_container_width=True, type="primary"):
+                                if not q_wname:
+                                    st.error("도매처를 입력해주세요.")
+                                else:
+                                    st.session_state.product_master.append({
+                                        "option_id":     opt_id,
+                                        "product_name":  sample["product_name"],
+                                        "cost_price":    q_cost,
+                                        "sale_price":    q_sale,
+                                        "fee_rate":      q_fee,
+                                        "wholesale_name":q_wname,
+                                        "wholesale_url": q_wurl,
+                                    })
+                                    try:
+                                        save_product_master_to_sheet()
+                                    except Exception:
+                                        pass
+                                    st.success(f"✅ 등록 완료! 이 옵션 주문 {len(orders_for_opt)}건이 '{q_wname}' 탭으로 분류됩니다.")
+                                    st.rerun()
+
+                st.divider()
+                st.markdown("##### 📋 미매핑 주문 상세")
                 for o in unmatched:
                     with st.container(border=True):
                         st.markdown(
@@ -1738,8 +1825,6 @@ def render_dashboard():
                             + (f" | 요청: {o['delivery_message']}" if o["delivery_message"] else "")
                         )
                         st.code(quick_copy, language=None)
-
-                        st.caption("💡 사이드바에서 해당 옵션ID를 등록하면 도매사별 탭으로 자동 분류됩니다.")
                 continue
 
             # 일반 도매사 탭
@@ -2070,6 +2155,10 @@ def render_sourcing_page():
 #  진입점
 # ══════════════════════════════════════════
 def main():
+    # F5 새로고침해도 로그인 유지: URL에 유효한 토큰이 있으면 자동 로그인 처리
+    if not st.session_state.logged_in:
+        _check_url_auth()
+
     # 로그인 상태가 아니면 로그인 페이지만 표시
     if not st.session_state.logged_in:
         login_page()
