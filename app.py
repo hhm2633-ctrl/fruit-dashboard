@@ -895,6 +895,40 @@ def load_orders_cache_from_sheet() -> list:
     return orders
 
 
+# ── 원가비교(도매처 단가) 캐시 저장/불러오기 — 구글시트 (세션이 끊겨도 영구 유지) ──
+_VENDOR_ITEMS_HEADERS = ["공급사", "원본상품명", "원가"]
+
+
+def save_vendor_items_to_sheet(all_items: list):
+    """원가비교에서 파싱한 원본 항목 전체를 구글 시트에 덮어쓰기 저장."""
+    ws = _get_or_create_worksheet("원가비교캐시", _VENDOR_ITEMS_HEADERS)
+    ws.clear()
+    ws.append_row(_VENDOR_ITEMS_HEADERS)
+    rows = [[it["공급사"], it["원본상품명"], it["원가"]] for it in all_items]
+    if rows:
+        ws.append_rows(rows)
+
+
+def load_vendor_items_from_sheet() -> list:
+    """구글 시트에 저장된 원가비교 원본 항목을 불러옴."""
+    ws = _get_or_create_worksheet("원가비교캐시", _VENDOR_ITEMS_HEADERS)
+    records = ws.get_all_records()
+    items = []
+    for r in records:
+        if not r.get("원본상품명"):
+            continue
+        try:
+            price = float(r.get("원가", 0) or 0)
+        except (ValueError, TypeError):
+            price = 0
+        items.append({
+            "공급사": str(r.get("공급사", "")),
+            "원본상품명": str(r.get("원본상품명", "")),
+            "원가": price,
+        })
+    return items
+
+
 # ══════════════════════════════════════════
 #  사이드바 – 상품 마스터 관리
 # ══════════════════════════════════════════
@@ -1024,6 +1058,41 @@ def _render_product_master_panel():
                     st.session_state._pm_form_key += 1  # 성공했을 때만 폼 리셋
                     st.success(f"✅ '{product_name}' 등록 완료!")
                     st.rerun()
+
+    # ── 도매처 이름 일괄 병합 (예: "최고"와 "최고집"이 사실 같은 곳일 때 한 번에 합치기) ──
+    wholesale_names = sorted({
+        p["wholesale_name"] for p in st.session_state.product_master if p.get("wholesale_name")
+    })
+    if len(wholesale_names) >= 2:
+        with st.expander("🔀 도매처 이름 병합/정리", expanded=False):
+            st.caption("같은 도매처인데 이름이 다르게 저장된 경우, 여기서 한 번에 합칠 수 있어요.")
+            mc1, mc2 = st.columns(2)
+            src_name = mc1.selectbox("이 이름을", wholesale_names, key="merge_src")
+            dst_options = [n for n in wholesale_names if n != src_name]
+            dst_name = mc2.selectbox("이 이름으로 합치기", dst_options, key="merge_dst") if dst_options else None
+
+            affected = [p for p in st.session_state.product_master if p.get("wholesale_name") == src_name]
+            st.caption(f"'{src_name}' 으로 등록된 상품 {len(affected)}개가 '{dst_name}' 으로 변경됩니다.")
+
+            if dst_name and st.button(f"🔀 '{src_name}' → '{dst_name}' 으로 병합", use_container_width=True, type="primary"):
+                for p in st.session_state.product_master:
+                    if p.get("wholesale_name") == src_name:
+                        p["wholesale_name"] = dst_name
+                        # URL이 비어있는 상품은 병합 대상 도매처의 URL로 같이 채워줌
+                        if not p.get("wholesale_url"):
+                            ref_url = next(
+                                (q["wholesale_url"] for q in st.session_state.product_master
+                                 if q.get("wholesale_name") == dst_name and q.get("wholesale_url")),
+                                "",
+                            )
+                            if ref_url:
+                                p["wholesale_url"] = ref_url
+                try:
+                    save_product_master_to_sheet()
+                except Exception:
+                    pass
+                st.success(f"✅ {len(affected)}개 상품을 '{dst_name}' 으로 병합했습니다!")
+                st.rerun()
 
     # 등록 상품 목록
     count = len(st.session_state.product_master)
@@ -1778,12 +1847,23 @@ def render_sourcing_page():
 
     if not uploaded_files:
         cached = st.session_state.get("_vendor_items_cache") or []
+        if not cached and st.session_state.gsheet_url:
+            try:
+                cached = load_vendor_items_from_sheet()
+                if cached:
+                    st.session_state._vendor_items_cache = cached
+            except Exception:
+                pass
         if cached:
             all_items = cached
             cc1, cc2 = st.columns([4, 1])
             cc1.success(f"📦 이전에 업로드한 데이터를 사용 중입니다 (총 {len(all_items)}개 항목). 새 파일을 올리면 자동으로 갱신돼요.")
             if cc2.button("🗑️ 초기화", use_container_width=True):
                 st.session_state._vendor_items_cache = []
+                try:
+                    save_vendor_items_to_sheet([])
+                except Exception:
+                    pass
                 st.rerun()
         else:
             st.info(
@@ -1834,8 +1914,12 @@ def render_sourcing_page():
             all_items.extend(items)
             st.caption(f"✅ {f.name}: {len(items)}개 항목 인식 (도매처: {vendor_name})")
 
-        # 페이지를 이동했다 돌아와도 다시 업로드 안 해도 되게 세션에 캐싱
+        # 페이지를 이동했다 돌아와도, 새로고침해도, 세션이 끊겨도 다시 업로드 안 해도 되게 저장
         st.session_state._vendor_items_cache = all_items
+        try:
+            save_vendor_items_to_sheet(all_items)
+        except Exception:
+            pass  # 구글시트 미설정 시 조용히 무시 (세션 내에서는 계속 사용 가능)
 
     if not all_items:
         return
@@ -1991,7 +2075,7 @@ def main():
         login_page()
         return
 
-    # 구글시트가 연동되어 있으면, 세션당 1회 자동으로 상품마스터/마지막 주문을 불러옴
+    # 구글시트가 연동되어 있으면, 세션당 1회 자동으로 상품마스터/마지막 주문/원가비교 데이터를 불러옴
     # (새로고침/재접속할 때마다 다시 입력·업로드할 필요 없게)
     if st.session_state.gsheet_url and not st.session_state._synced_from_sheet:
         try:
@@ -1999,6 +2083,24 @@ def main():
                 st.session_state.product_master = load_product_master_from_sheet()
             if not st.session_state.orders:
                 st.session_state.orders = load_orders_cache_from_sheet()
+            if not st.session_state._vendor_items_cache:
+                st.session_state._vendor_items_cache = load_vendor_items_from_sheet()
+            if st.session_state._vendor_items_cache and not st.session_state._vendor_compare_summary:
+                tree = group_vendor_items(st.session_state._vendor_items_cache)
+                summary = {}
+                for base, specs in tree.items():
+                    vendors, all_costs = set(), []
+                    for spec_vendors in specs.values():
+                        for v, c in spec_vendors.items():
+                            if v == "_원본예시":
+                                continue
+                            vendors.add(v)
+                            all_costs.append(c)
+                    summary[base] = {
+                        "vendor_count": len(vendors), "vendors": sorted(vendors),
+                        "min_cost": min(all_costs) if all_costs else None,
+                    }
+                st.session_state._vendor_compare_summary = summary
         except Exception:
             pass  # 연동 설정이 미완료여도 앱은 정상 동작
         st.session_state._synced_from_sheet = True
